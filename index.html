@@ -4406,7 +4406,12 @@ function mergeStates(local, remote){
   var snap={}; (local.snapshots||[]).concat(remote.snapshots||[]).forEach(function(s){ if(s&&s.date) snap[s.date]=s; });
   out.snapshots=Object.keys(snap).sort().map(function(d){return snap[d];});
   // preference-type fields follow the newer snapshot
-  ['settings','profile','track','level','dailyGoal','courseFilter','librarySub','tab','goals','lastFreezeGrant','dailyProblem'].forEach(function(p){ if(prefer[p]!==undefined) out[p]=deepClone(prefer[p]); });
+  // daily problem: same day → OR the attempted/correct flags (a device that skipped today's POTD must not wipe the other's completion or let it be re-solved for XP); different day → newer wins
+  var ldp=local.dailyProblem||{}, rdp=remote.dailyProblem||{};
+  out.dailyProblem = (ldp.date && ldp.date===rdp.date)
+    ? { date:ldp.date, attempted:!!(ldp.attempted||rdp.attempted), correct:!!(ldp.correct||rdp.correct) }
+    : deepClone(rTs>=lTs ? rdp : ldp);
+  ['settings','profile','track','level','dailyGoal','courseFilter','librarySub','tab','goals','lastFreezeGrant'].forEach(function(p){ if(prefer[p]!==undefined) out[p]=deepClone(prefer[p]); });
   out.hasOnboarded=!!(local.hasOnboarded || remote.hasOnboarded);
   out.updatedAt=Math.max(lTs, rTs);
   return out;
@@ -4415,7 +4420,7 @@ var SYNC = (function(){
   var supa=null, session=null, _email=null;
   var pushTimer=null, pulling=false, lastSyncedAt=0;
   var statusKind='idle', statusText='', _adopting=false;
-  var channel=null, channelUser=null, lastPushAt=0;
+  var channel=null, channelUser=null, lastPushAt=0, lastPushedIso=null;
 
   function configured(){ return !!(SUPABASE_URL && SUPABASE_ANON_KEY && window.supabase && window.supabase.createClient); }
   function online(){ return navigator.onLine!==false; }
@@ -4464,18 +4469,20 @@ var SYNC = (function(){
     try{
       channel = supa.channel('axiom-'+channelUser)
         .on('postgres_changes', { event:'*', schema:'public', table:'axiom_state', filter:'user_id=eq.'+channelUser },
-            function(){ if(Date.now()-lastPushAt > 1500) pullNow(); })   // skip the echo of our own just-pushed write
-        .subscribe();
-    }catch(e){ channel=null; }
+            function(payload){ var ts=payload && payload['new'] && payload['new'].updated_at; if(ts && ts===lastPushedIso) return; pullNow(); })   // skip ONLY the exact echo of our own write (by value, not a time window)
+        .subscribe(function(st){ if(st==='CLOSED'||st==='CHANNEL_ERROR'){ channel=null; channelUser=null; } });   // a dropped channel rebuilds on the next focus/online
+    }catch(e){ channel=null; channelUser=null; }
   }
 
   function pullNow(){
     if(!supa || !session || pulling) return;
     if(!online()){ setStatus('offline','Offline — will sync when back online'); return; }
     pulling=true; setStatus('syncing','Syncing…');
+    var done=false;
+    var to=setTimeout(function(){ if(done) return; done=true; pulling=false; if(statusKind==='syncing') setStatus('idle',''); }, 15000);   // never wedge inbound sync on a hung request
     supa.from('axiom_state').select('data,updated_at').eq('user_id', session.user.id).maybeSingle()
       .then(function(res){
-        pulling=false;
+        if(done) return; done=true; clearTimeout(to); pulling=false;
         if(res.error){ setStatus('error','Sync error'); return; }
         var remote = res.data && res.data.data || null;
         var uid = session.user.id;
@@ -4500,7 +4507,7 @@ var SYNC = (function(){
         else { state._syncUser=uid; state.updatedAt=merged.updatedAt; persistLocal(); }
         if(changedRemote) pushNow();
         markSynced();
-      }, function(){ pulling=false; setStatus('error','Sync error'); });
+      }, function(){ if(done) return; done=true; clearTimeout(to); pulling=false; setStatus('error','Sync error'); });
   }
   function setUser(o, uid){ o._syncUser=uid; return o; }
   function persistLocal(){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){} }
@@ -4531,7 +4538,7 @@ var SYNC = (function(){
     setStatus('syncing','Saving…');
     var payload={ user_id:session.user.id, data:state, updated_at:new Date(state.updatedAt||now()).toISOString() };
     supa.from('axiom_state').upsert(payload, { onConflict:'user_id' })
-      .then(function(res){ if(res.error){ setStatus('error','Sync error'); } else { lastPushAt=Date.now(); markSynced(); } },
+      .then(function(res){ if(res.error){ setStatus('error','Sync error'); } else { lastPushAt=Date.now(); lastPushedIso=payload.updated_at; markSynced(); } },
             function(){ setStatus('error','Sync error'); });
   }
 
@@ -5132,14 +5139,15 @@ GEN['powers-eval'] = function(rng,diff){
     hints:['An exponent means repeated multiplication.','$'+b+'^{'+e+'}$ is '+e+' copies of '+b+' multiplied.'] };
 };
 GEN['gcf'] = function(rng,diff){
-  var g=ri(rng,2,byDiff(diff,[4,6,8,10,12])), p=ri(rng,2,byDiff(diff,[5,7,9,12,15])), q=ri(rng,2,byDiff(diff,[5,7,9,12,15]));
+  var hi=byDiff(diff,[5,7,9,12,15]), g=ri(rng,2,byDiff(diff,[4,6,8,10,12]));
+  var p=ri(rng,2,hi), q=ri(rng,2,hi), guard=0; while((q===p || gcd(p,q)!==1) && guard++<40){ p=ri(rng,2,hi); q=ri(rng,2,hi); }   // coprime + distinct → g IS the gcf, and never a trivial (n,n)
   var a=g*p, b=g*q; var ans=gcd(a,b);
   return { promptTeX:'\\gcd('+a+', '+b+') = \\;?', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
-    solutionTeX:'The greatest common factor of $'+a+'$ and $'+b+'$ is $'+ans+'$.',
+    solutionTeX:'$'+a+' = '+ans+'\\times'+(a/ans)+'$ and $'+b+' = '+ans+'\\times'+(b/ans)+'$, and those two factors share nothing — so the greatest common factor is $'+ans+'$.',
     hints:['Find the biggest number that divides both.','List shared prime factors and multiply them.'] };
 };
 GEN['lcm'] = function(rng,diff){
-  var a=ri(rng,2,byDiff(diff,[6,9,12,15,20])), b=ri(rng,2,byDiff(diff,[6,9,12,15,20])); var ans=a*b/gcd(a,b);
+  var lh=byDiff(diff,[6,9,12,15,20]); var a=ri(rng,2,lh), b=ri(rng,2,lh), gb=0; while(b===a && gb++<20) b=ri(rng,2,lh); var ans=a*b/gcd(a,b);
   return { promptTeX:'\\text{lcm}('+a+', '+b+') = \\;?', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
     solutionTeX:'$\\text{lcm}('+a+','+b+') = \\frac{'+a+'\\times'+b+'}{\\gcd('+a+','+b+')} = \\frac{'+(a*b)+'}{'+gcd(a,b)+'} = '+ans+'$.',
     hints:['The smallest number both divide into evenly.','lcm $=$ product $\\div$ gcd.'] };
@@ -5957,7 +5965,9 @@ function greeting(){ var h=new Date().getHours(); return h<12?'Good morning':(h<
 function renderToday(){
   var root=el('tab-today');
   var inProgress = COURSES.filter(function(c){ return courseStatus(c).status==='in-progress'; });
-  var resumeCourse = inProgress[0] || COURSES.filter(function(c){return courseStatus(c).status==='not-started';})[0] || COURSES[0];
+  var notStarted = COURSES.filter(function(c){return courseStatus(c).status==='not-started';});
+  var onGrade = notStarted.filter(function(c){ return state.courseFilter && state.courseFilter!=='all' && c.category===state.courseFilter; });
+  var resumeCourse = inProgress[0] || onGrade[0] || notStarted[0] || COURSES[0];   // prefer a not-started course on the user's grade/track before defaulting to Numbers 101
   var rs = resumeCourse ? courseStatus(resumeCourse) : null;
   var due = dueSkills();
   ensureDailyProblem();
@@ -6380,7 +6390,7 @@ function startWarmup(){
   // a short, low-pressure interleaved set: learned skills if any, else the daily
   // pool — ordered easy→harder (lower Leitner boxes first) for a gentle ramp.
   var learned=[]; for(var id in state.skillStats){ if(state.skillStats[id].attempts>0 && SKILL_BY_ID[id]) learned.push(id); }
-  var ids = learned.length>=3 ? learned : POTD_POOL.slice();
+  var ids = learned.length>=3 ? learned : potdPool().slice();   // keep the warm-up on-grade (was the one daily path that ignored the focus track)
   ids.sort(function(a,b){ return ((state.skillStats[a]||{box:0}).box) - ((state.skillStats[b]||{box:0}).box); });
   startSession(ids, 'Warm-up', 5);
 }
@@ -7523,8 +7533,8 @@ function migrateAllStats(){
   // already-paid — so the new reward guards don't let a returning user re-mint XP by toggling.
   state.courseRewarded=state.courseRewarded||{}; state.courseCompleted=state.courseCompleted||{};
   for(var cid in state.courseProgress){ var pr=state.courseProgress[cid]; if(!pr||!pr.length) continue;
-    var rw=state.courseRewarded[cid]=state.courseRewarded[cid]||[]; var allDone=true;
-    for(var di=0;di<pr.length;di++){ if(pr[di]) rw[di]=true; else allDone=false; }
+    var rw=state.courseRewarded[cid]=state.courseRewarded[cid]||[]; var cc=COURSES.filter(function(x){return x.id===cid;})[0]; var nn=cc?cc.days.length:pr.length; var allDone=true;
+    for(var di=0;di<nn;di++){ if(pr[di]) rw[di]=true; else allDone=false; }   // gauge completion against the LIVE day count, not a stale array — else an extended course never re-fires its bonus
     if(allDone && !state.courseCompleted[cid]) state.courseCompleted[cid]=now();
   }
 }
