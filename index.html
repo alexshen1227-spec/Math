@@ -4889,7 +4889,7 @@ GEN['mult-by-11'] = function(rng,diff){
   var t=Math.floor(a/10), u=a%10, mid=t+u;
   var sol = mid<10
     ? 'Split the digits of $'+a+'$ and drop their sum in the middle: $'+t+'\\,|\\,'+t+'+'+u+'\\,|\\,'+u+' = '+t+''+mid+''+u+' = '+ans+'$.'
-    : 'Add the digits: $'+t+'+'+u+'='+mid+'$. Since that is $\\ge 10$, write the '+u+', carry the 1 into the tens: $'+ans+'$.';
+    : 'Add the digits: $'+t+'+'+u+'='+mid+'$. Since that is $\\ge 10$, write the '+(mid-10)+', carry the 1 into the tens: $'+ans+'$.';
   return { promptTeX:a+' \\times 11 = \\;?', answer:String(ans), accept:function(x){return acceptNumeric(x,ans);},
     solutionTeX: sol,
     hints:['Split the two digits and add them in the middle.','If that middle sum is 10 or more, carry the 1 leftward.'] };
@@ -5337,7 +5337,7 @@ var SKILL_BY_ID = {}; SKILLS.forEach(function(s){ SKILL_BY_ID[s.id]=s; });
 var TRACKS = {
   all:          { id:'all',          name:'Everything',     icon:'🌐', desc:'All topics, fully adaptive',           topics:['Arithmetic','Fractions','Mental Math','Algebra','Geometry & Trig','Calculus','Estimation','Reasoning','Probability','Logic & Proof','Problem Solving'] },
   core:         { id:'core',         name:'Core skills',    icon:'🎯', desc:'Everything except calculus',           topics:['Arithmetic','Fractions','Mental Math','Algebra','Geometry & Trig','Estimation','Statistics'] },
-  foundations:  { id:'foundations',  name:'Foundations',    icon:'🔢', desc:'Arithmetic, fractions, percents',       topics:['Arithmetic','Fractions','Mental Math','Estimation','Statistics'] },
+  foundations:  { id:'foundations',  name:'Foundations',    icon:'🔢', desc:'Arithmetic, fractions, percents',       topics:['Arithmetic','Fractions','Mental Math','Estimation','Statistics'], skills:['evaluate-expr','distribute','solve-linear'] },
   algebra:      { id:'algebra',      name:'Algebra',        icon:'📐', desc:'Equations, factoring, systems',         topics:['Algebra'] },
   geometry:     { id:'geometry',     name:'Geometry & Trig',icon:'📏', desc:'Shapes, Pythagoras, the unit circle',   topics:['Geometry & Trig'] },
   calculus:     { id:'calculus',     name:'Calculus',       icon:'∫',  desc:'Limits, derivatives, integrals',        topics:['Calculus'] },
@@ -5352,7 +5352,7 @@ var GRADES = [
   { id:'7',     label:'7th grade',                lvl:2, track:'foundations', sub:'Negative numbers, proportions, percents' },
   { id:'8',     label:'8th grade',                lvl:3, track:'core',        sub:'Linear equations, exponents, Pythagoras' },
   { id:'alg1',  label:'9th · Algebra 1',          lvl:3, track:'algebra',     sub:'Solving equations, factoring, slope, systems' },
-  { id:'geo',   label:'10th · Geometry',          lvl:3, track:'geometry',    sub:'Area, the Pythagorean theorem, coordinates' },
+  { id:'geo',   label:'10th · Geometry',          lvl:3, track:'geometry',    sub:'Area, the Pythagorean theorem, circles' },
   { id:'alg2',  label:'11th · Algebra 2',         lvl:4, track:'algebra',     sub:'Quadratics, sequences, functions' },
   { id:'calc',  label:'12th · Pre-calc / Calculus', lvl:5, track:'calculus',  sub:'Limits, derivatives, integrals' },
   { id:'adult', label:'Out of school',            lvl:3, track:'all',         sub:'Brushing up — we’ll adapt to you fast' }
@@ -5555,7 +5555,7 @@ function weakestSkill(){
 function trackSkillIds(){
   var t=TRACKS[state.track]; var all=SKILLS.map(function(s){return s.id;});
   if(!t || t.id==='all') return all;
-  var ids=all.filter(function(id){ var s=SKILL_BY_ID[id]; return s && t.topics.indexOf(s.topic)>=0; });
+  var ids=all.filter(function(id){ var s=SKILL_BY_ID[id]; return s && (t.topics.indexOf(s.topic)>=0 || (t.skills && t.skills.indexOf(id)>=0)); });   // a track can also allowlist individual skills (e.g. foundations adds beginner algebra without the whole topic)
   return ids.length ? ids : all;   // never strand the user with an empty pool
 }
 function composeAdaptiveSession(n){
@@ -6125,6 +6125,7 @@ function mountPotd(){
     h+='<div class="micro" style="text-align:center;margin-top:8px;text-transform:none;letter-spacing:0;font-size:11px;color:var(--muted)">'+escapeHtml(formatHintFor(potdIt))+'</div>';
     h+=keypadFor(potdIt);   // same symbol keypad as a practice session (POTD pool has symbol-heavy skills)
     h+='<button class="btn-accent w-full rounded-xl py-3 text-sm mt-3" data-act="checkPotd">Check answer</button>';
+    h+='<button class="btn-ghost w-full rounded-xl py-2.5 text-sm mt-2" style="color:var(--muted,#9a9a9a)" data-act="potdGiveUp">Give up &amp; show answer</button>';
   } else {
     h+='<div id="potd-result"></div>';
   }
@@ -7259,7 +7260,7 @@ function finishOnboarding(step, placement){
   if(step.grade) state.profile.grade = step.grade;
   state.track = step.track || 'all';
   state.goals={ level:step.level||'Beginner', focus:[] };
-  var trackCourseFilter={ foundations:'Foundations', algebra:'Algebra', geometry:'Geometry & Trig', calculus:'Calculus', reasoning:'Reasoning', all:'all' };
+  var trackCourseFilter={ foundations:'Foundations', core:'Algebra', algebra:'Algebra', geometry:'Geometry & Trig', calculus:'Calculus', reasoning:'Reasoning', all:'all' };
   state.courseFilter = trackCourseFilter[state.track]||'all';
   if(step.levelNum){ seedLevel(step.levelNum); }   // seeds starting difficulty for the chosen track
   saveState();
@@ -7317,6 +7318,7 @@ function handleAct(act, arg, target){
     case 'setLibrarySub': state.librarySub=arg; state._libQuery=''; saveState(); renderLibrary(); break;
     case 'toggleBookmark': toggleBookmark(arg); break;
     case 'checkPotd': checkPotd(); break;
+    case 'potdGiveUp': potdGiveUp(); break;
     case 'toggleSetting': toggleSetting(arg); break;
     case 'setAccent': setAccent(arg); break;
     case 'incGoal': state.dailyGoal=clamp((state.dailyGoal||10)+5,5,100); saveState(); openSettings(); break;
@@ -7380,7 +7382,13 @@ function checkPotd(){
   recordAnswer(_potd.skill.id, ok); // counts toward streak + stats
   if(ok){ chimeOk(); vibrate(18); } else { buzzWrong(); vibrate([30,40,30]); }
   saveState();
-  mountPotd();
+  renderToday();   // refresh the whole Today screen (goal ring, streak, stat tiles), not just the POTD widget — it re-mounts the POTD itself
+}
+function potdGiveUp(){
+  if(!_potd || state.dailyProblem.attempted) return;
+  state.dailyProblem.attempted=true; state.dailyProblem.correct=false;
+  recordAnswer(_potd.skill.id, false);   // counts as not-correct, like the in-session give-up
+  saveState(); renderToday();
 }
 function toggleSetting(key){ state.settings[key]=!state.settings[key]; saveState(); if(key==='reduceMotion') applyMotion(); openSettings(); if(key==='sound'&&state.settings.sound) chimeOk(); if(key==='confetti'&&state.settings.confetti) confetti(70); }
 function setAccent(name){ state.settings.accent=name; document.documentElement.dataset.accent=name; saveState(); openSettings(); }
@@ -7388,7 +7396,7 @@ function setGrade(id){
   var g=gradeById(id); if(!g) return;
   state.profile=state.profile||{}; state.profile.grade=g.id;
   state.track=g.track;
-  var trackCourseFilter={ foundations:'Foundations', algebra:'Algebra', geometry:'Geometry & Trig', calculus:'Calculus', reasoning:'Reasoning', all:'all' };
+  var trackCourseFilter={ foundations:'Foundations', core:'Algebra', algebra:'Algebra', geometry:'Geometry & Trig', calculus:'Calculus', reasoning:'Reasoning', all:'all' };
   state.courseFilter=trackCourseFilter[g.track]||'all';
   seedLevel(g.lvl);   // re-seeds untested skills to the new level + sets state.level (practiced skills keep their hard-won rating)
   saveState(); openSettings(); toast('Set to '+g.label);
