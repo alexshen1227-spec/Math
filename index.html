@@ -5261,6 +5261,16 @@ GEN['percent-increase'] = function(rng,diff){
     solutionTeX:'$'+base+'\\times'+((100+pct)/100)+' = '+fmtNum(ans)+'$ — that is $(100+'+pct+')\\%$ of it.',
     hints:['Add the increase to the original — or take $(100+'+pct+')\\%$.','$'+base+'\\times'+((100+pct)/100)+'$'] };
 };
+GEN['divide-fractions'] = function(rng,diff){
+  var b=ri(rng,2,byDiff(diff,[4,6,8,9,12])), d=ri(rng,2,byDiff(diff,[4,6,8,9,12]));
+  var a=ri(rng,1,b-1), ga=0; while(gcd(a,b)!==1 && ga++<20) a=ri(rng,1,b-1);
+  var c=ri(rng,1,d-1), gc=0; while(gcd(c,d)!==1 && gc++<20) c=ri(rng,1,d-1);
+  var num=a*d, den=b*c; var g=gcd(num,den); var rp=num/g, rq=den/g;
+  return { promptTeX:'\\frac{'+a+'}{'+b+'} \\div \\frac{'+c+'}{'+d+'} = \\;?', answer:fracTeX(num,den), plain:rp+'/'+rq,
+    accept:function(x){return acceptReducedFraction(x, rp, rq);},
+    solutionTeX:'Multiply by the reciprocal: $\\frac{'+a+'}{'+b+'} \\times \\frac{'+d+'}{'+c+'} = \\frac{'+num+'}{'+den+'} = '+fracTeX(num,den)+'$.',
+    hints:['Dividing by a fraction means multiplying by its reciprocal.','Flip the second fraction, then multiply across.'] };
+};
 
 // ================================================================
 // SKILL REGISTRY — generators + (later) conceptual banks merged in.
@@ -5314,7 +5324,8 @@ var GEN_META = [
   ['range-stat','Range','Statistics','Beginner'],
   ['mode-stat','Mode','Statistics','Beginner'],
   ['rounding-decimals','Rounding decimals','Arithmetic','Beginner'],
-  ['percent-increase','Percent increase','Fractions','Intermediate']
+  ['percent-increase','Percent increase','Fractions','Intermediate'],
+  ['divide-fractions','Divide fractions','Fractions','Beginner']
 ];
 var SKILLS = [];
 GEN_META.forEach(function(m){ SKILLS.push({ id:m[0], name:m[1], topic:m[2], level:m[3], kind:'gen', gen:GEN[m[0]] }); });
@@ -6424,7 +6435,7 @@ function formatHintFor(it){
 // skills get the mobile numeric keypad.
 // includes every skill that can produce a NEGATIVE answer — 'decimal' inputmode has no
 // minus key on iOS/Android, so those must use 'text' (full keyboard) or be unanswerable
-var NEEDS_TEXT = {'expand-foil':1,'factor-trinomial':1,'diff-of-squares':1,'solve-quadratic':1,'linear-systems':1,'power-rule':1,'basic-integral':1,'simplify-fraction':1,'add-fractions':1,'multiply-fractions':1,'fdp-convert':1,'slope-two-points':1,'distribute':1,'circle-area':1,'negatives':1,'evaluate-expr':1,'solve-linear':1,'two-step-equation':1,'simple-limit':1,'percent-change':1,'arithmetic-sequence':1,'circumference':1};
+var NEEDS_TEXT = {'expand-foil':1,'factor-trinomial':1,'diff-of-squares':1,'solve-quadratic':1,'linear-systems':1,'power-rule':1,'basic-integral':1,'simplify-fraction':1,'add-fractions':1,'multiply-fractions':1,'fdp-convert':1,'slope-two-points':1,'distribute':1,'circle-area':1,'negatives':1,'evaluate-expr':1,'solve-linear':1,'two-step-equation':1,'simple-limit':1,'percent-change':1,'arithmetic-sequence':1,'circumference':1,'divide-fractions':1};
 function inputModeFor(it){ return (it && it.type==='input' && !NEEDS_TEXT[it.skillId]) ? 'decimal' : 'text'; }
 // a small symbol keypad for awkward-to-type characters on mobile (per skill type)
 function keypadFor(it){
