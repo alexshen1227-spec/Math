@@ -50,7 +50,7 @@ same-origin CSP. Works offline from a cold first launch.
 | `manifest.json`, `sw.js`, `icons/`, `assets/` | PWA shell: manifest, service worker, icons, vendored KaTeX + fonts. |
 | `build_content/*.js` | Source of the content corpus (courses, articles, methods, strategies, glossary, MCQ banks). |
 | `scripts/` | Build/verify tooling (`assemble.js`, `validate.js`, `check-built.js`, …). |
-| `.github/workflows/deploy.yml` | Auto-deploys to GitHub Pages on every push to `main`. |
+| `.nojekyll` | Tells GitHub Pages to serve files verbatim (no Jekyll). The site is published from `main` / root and rebuilds on every push. |
 
 ### Building / editing content
 
