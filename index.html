@@ -4323,6 +4323,7 @@ function loadState(){
           if(k==='settings') continue;
           var sv=saved[k], def=DEFAULT_STATE[k];
           if(def===undefined){ base[k]=sv; }                                   // runtime flags
+          else if(def===null){ base[k]=sv; }                                   // nullable fields (level, goals, lastFreezeGrant) — keep any stored value, else they reset every reload
           else if(Array.isArray(def)){ if(Array.isArray(sv)) base[k]=sv; }
           else if(def && typeof def==='object'){ if(sv && typeof sv==='object' && !Array.isArray(sv)) base[k]=sv; }
           else if(typeof sv===typeof def){ base[k]=sv; }
@@ -4591,7 +4592,8 @@ function tokenize(str){
     .replace(/[×]/g,'*')      // ×
     .replace(/[÷]/g,'/')      // ÷
     .replace(/\*\*/g,'^')
-    .replace(/[{}]/g,function(c){ return c==='{'?'(':')'; });  // accept LaTeX-style x^{2}
+    .replace(/[{}]/g,function(c){ return c==='{'?'(':')'; })  // accept LaTeX-style x^{2}
+    .replace(/π/g,'pi');                                       // accept the π glyph (e.g. "25π")
   var toks=[], i=0;
   while(i<s.length){
     var c=s[i];
@@ -4700,7 +4702,7 @@ function acceptExpr(input, answerExpr, vars){
 function acceptUpToConstant(input, answerExpr){
   var diffs=[];
   for(var i=0;i<SAMPLE_XS.length;i++){
-    var scope={x:SAMPLE_XS[i], c:0};
+    var scope={x:SAMPLE_XS[i], c:0, k:0};   // "+C" or "+k" both read as a free constant
     var a=evalExpr(input,scope), b=evalExpr(answerExpr,scope);
     if(!isFinite(a)||!isFinite(b)) return false;
     diffs.push(b-a);
@@ -6289,7 +6291,9 @@ function formatHintFor(it){
 }
 // skills whose answers need letters/operators get a full keyboard; pure-numeric
 // skills get the mobile numeric keypad.
-var NEEDS_TEXT = {'expand-foil':1,'factor-trinomial':1,'diff-of-squares':1,'solve-quadratic':1,'linear-systems':1,'power-rule':1,'basic-integral':1,'simplify-fraction':1,'add-fractions':1,'multiply-fractions':1,'fdp-convert':1,'slope-two-points':1,'distribute':1,'circle-area':1};
+// includes every skill that can produce a NEGATIVE answer — 'decimal' inputmode has no
+// minus key on iOS/Android, so those must use 'text' (full keyboard) or be unanswerable
+var NEEDS_TEXT = {'expand-foil':1,'factor-trinomial':1,'diff-of-squares':1,'solve-quadratic':1,'linear-systems':1,'power-rule':1,'basic-integral':1,'simplify-fraction':1,'add-fractions':1,'multiply-fractions':1,'fdp-convert':1,'slope-two-points':1,'distribute':1,'circle-area':1,'negatives':1,'evaluate-expr':1,'solve-linear':1,'two-step-equation':1,'simple-limit':1,'percent-change':1,'arithmetic-sequence':1};
 function inputModeFor(it){ return (it && it.type==='input' && !NEEDS_TEXT[it.skillId]) ? 'decimal' : 'text'; }
 // a small symbol keypad for awkward-to-type characters on mobile (per skill type)
 function keypadFor(it){
@@ -6298,6 +6302,7 @@ function keypadFor(it){
   if(/expand-foil|factor-trinomial|diff-of-squares|power-rule|basic-integral|distribute/.test(id)) keys=['x','^','(',')','+','-'];
   else if(/solve-quadratic|linear-systems/.test(id)) keys=['x','y','=',',','-','/'];
   else if(/fraction|fdp-convert|percent|slope-two-points|simplify/.test(id)) keys=['/','-','.'];
+  else if(/circle-area/.test(id)) keys=['π','.'];   // the one skill whose answer is "kπ"
   if(!keys) return '';
   return '<div id="keypad" class="flex flex-wrap gap-2 mt-3" role="group" aria-label="Math symbol keypad">'
     + keys.map(function(k){ return '<button type="button" class="kp-key" data-key="'+escapeHtml(k)+'" aria-label="Insert '+escapeHtml(k)+'">'+escapeHtml(k)+'</button>'; }).join('')
@@ -6890,8 +6895,10 @@ function closeSheet(keepFocus){
   if(_sheetWrap){ _sheetWrap.remove(); _sheetWrap=null; }
   refreshBgInert();
   if(!keepFocus && _lastFocus){ try{ _lastFocus.focus({preventScroll:true}); }catch(e){} _lastFocus=null; }
-  // re-render the visible tab so settings changes (daily goal, name, focus track) apply immediately on close
-  if(!session){ try{ if(RENDERERS[state.tab]) RENDERERS[state.tab](); }catch(e){} }
+  // re-render the visible tab so settings changes (daily goal, name, focus track) apply
+  // immediately on a genuine CLOSE — but not when openSheet tears down to re-open (keepFocus),
+  // which would reset scroll / re-animate the tab behind every modal.
+  if(!keepFocus && !session){ try{ if(RENDERERS[state.tab]) RENDERERS[state.tab](); }catch(e){} }
 }
 function topmostDialog(){ var o=el('overlays'); if(!o) return null; var ds=o.querySelectorAll('[role="dialog"]'); return ds.length?ds[ds.length-1]:null; }
 var _toastQ=[], _toastBusy=false;
