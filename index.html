@@ -5262,9 +5262,9 @@ GEN['percent-increase'] = function(rng,diff){
     hints:['Add the increase to the original — or take $(100+'+pct+')\\%$.','$'+base+'\\times'+((100+pct)/100)+'$'] };
 };
 GEN['divide-fractions'] = function(rng,diff){
-  var b=ri(rng,2,byDiff(diff,[4,6,8,9,12])), d=ri(rng,2,byDiff(diff,[4,6,8,9,12]));
+  var hb=byDiff(diff,[4,6,8,9,12]); var b=ri(rng,3,hb), d=ri(rng,3,hb);
   var a=ri(rng,1,b-1), ga=0; while(gcd(a,b)!==1 && ga++<20) a=ri(rng,1,b-1);
-  var c=ri(rng,1,d-1), gc=0; while(gcd(c,d)!==1 && gc++<20) c=ri(rng,1,d-1);
+  var c=ri(rng,1,d-1), gc=0; while((gcd(c,d)!==1 || a*d===b*c) && gc++<25) c=ri(rng,1,d-1);   // coprime + the two fractions aren't equal (no trivial "÷ itself = 1")
   var num=a*d, den=b*c; var g=gcd(num,den); var rp=num/g, rq=den/g;
   return { promptTeX:'\\frac{'+a+'}{'+b+'} \\div \\frac{'+c+'}{'+d+'} = \\;?', answer:fracTeX(num,den), plain:rp+'/'+rq,
     accept:function(x){return acceptReducedFraction(x, rp, rq);},
