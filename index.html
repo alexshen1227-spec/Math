@@ -4409,7 +4409,7 @@ function mergeStates(local, remote){
   // daily problem: same day → OR the attempted/correct flags (a device that skipped today's POTD must not wipe the other's completion or let it be re-solved for XP); different day → newer wins
   var ldp=local.dailyProblem||{}, rdp=remote.dailyProblem||{};
   out.dailyProblem = (ldp.date && ldp.date===rdp.date)
-    ? { date:ldp.date, attempted:!!(ldp.attempted||rdp.attempted), correct:!!(ldp.correct||rdp.correct) }
+    ? { date:ldp.date, attempted:!!(ldp.attempted||rdp.attempted), correct:!!(ldp.correct||rdp.correct), skillId:ldp.skillId||rdp.skillId, diff:(typeof ldp.diff==='number'?ldp.diff:rdp.diff) }
     : deepClone(rTs>=lTs ? rdp : ldp);
   ['settings','profile','track','level','dailyGoal','courseFilter','librarySub','tab','goals','lastFreezeGrant'].forEach(function(p){ if(prefer[p]!==undefined) out[p]=deepClone(prefer[p]); });
   out.hasOnboarded=!!(local.hasOnboarded || remote.hasOnboarded);
@@ -5135,7 +5135,7 @@ GEN['rounding-estimate'] = function(rng,diff){
 GEN['powers-eval'] = function(rng,diff){
   var b=ri(rng,2,byDiff(diff,[3,4,5,7,10])), e=ri(rng,2,byDiff(diff,[2,3,3,4,4])); var ans=Math.pow(b,e);
   return { promptTeX:b+'^{'+e+'} = \\;?', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
-    solutionTeX:'$'+b+'^{'+e+'} = '+ans+'$ — multiply '+b+' by itself '+e+' times.',
+    solutionTeX:'$'+b+'^{'+e+'} = '+ans+'$ — use '+b+' as a factor '+e+' times.',
     hints:['An exponent means repeated multiplication.','$'+b+'^{'+e+'}$ is '+e+' copies of '+b+' multiplied.'] };
 };
 GEN['gcf'] = function(rng,diff){
@@ -6100,17 +6100,27 @@ function statCard(v,label,suffix){ return '<div class="card-2 py-3 text-center">
 
 // Problem of the Day — deterministic by date.
 function ensureDailyProblem(){
-  var t=todayStr();
-  if(state.dailyProblem.date!==t){ state.dailyProblem={date:t, attempted:false, correct:false}; saveState(); }
+  var t=todayStr(); var dp=state.dailyProblem;
+  if(dp.date!==t){
+    // freeze the day's skill + difficulty so the worked solution always matches the
+    // prompt the user solved, even if answering it later flips the skill's tier
+    var seed=hashStr('potd-'+t); var pool=potdPool(); var sid=pool[seed % pool.length];
+    state.dailyProblem={date:t, attempted:false, correct:false, skillId:sid, diff:clamp((statFor(sid).tier||2)-1,0,4)};
+    saveState();
+  } else if(!dp.skillId || typeof dp.diff!=='number'){   // backfill a problem created before the freeze existed
+    var sd=hashStr('potd-'+t); var pl=potdPool(); var sid2=dp.skillId || pl[sd % pl.length];
+    dp.skillId=sid2; dp.diff=(typeof dp.diff==='number')?dp.diff:clamp((statFor(sid2).tier||2)-1,0,4); saveState();
+  }
 }
 function potdPool(){ var t=trackSkillIds(); var p=POTD_POOL.filter(function(id){ return t.indexOf(id)>=0; }); return p.length>=3 ? p : POTD_POOL; }   // keep the daily problem/challenge on-grade for the user's focus
 function getDailyProblem(){
-  var t=todayStr(); var seed=hashStr('potd-'+t);
-  var pool = potdPool(); var skillId = pool[seed % pool.length];
-  var skill = SKILL_BY_ID[skillId];
+  ensureDailyProblem();
+  var t=todayStr(); var seed=hashStr('potd-'+t); var dp=state.dailyProblem;
+  var skillId = dp.skillId || potdPool()[seed % potdPool().length];
+  var skill = SKILL_BY_ID[skillId]; if(!skill){ skillId=POTD_POOL[seed % POTD_POOL.length]; skill=SKILL_BY_ID[skillId]; }
   var rng = mulberry32(seed);
-  var st = statFor(skillId);
-  var prob = skill.gen(rng, clamp((st.tier||2)-1, 0, 4));   // daily problem matches your level on that skill
+  var diff = (typeof dp.diff==='number') ? dp.diff : clamp((statFor(skillId).tier||2)-1, 0, 4);   // frozen for the day
+  var prob = skill.gen(rng, diff);
   return { skill:skill, prob:prob };
 }
 var _potd=null;
