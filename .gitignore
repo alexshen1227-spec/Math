@@ -1,0 +1,14 @@
+# Local agent / editor config — not part of the app
+.claude/
+
+# OS / editor junk
+.DS_Store
+Thumbs.db
+desktop.ini
+*~
+.vscode/
+.idea/
+
+# Node (none committed today, but keep it out if ever added)
+node_modules/
+npm-debug.log*
