@@ -9,7 +9,7 @@
    glyphs and all — works offline on a cold first launch with zero
    third-party runtime dependencies.
    ============================================================ */
-const CACHE_VERSION = 'axiom-v1.5.0';
+const CACHE_VERSION = 'axiom-v1.6.0';
 const CACHE = CACHE_VERSION;
 
 // Complete app shell — everything needed to render fully offline.
@@ -20,6 +20,7 @@ const CORE = [
   './assets/katex.min.css',
   './assets/katex.min.js',
   './assets/auto-render.min.js',
+  './assets/supabase.min.js',
   './assets/fonts.css',
   './icons/icon-192.png',
   './icons/icon-512.png',
@@ -85,6 +86,10 @@ self.addEventListener('fetch', (e) => {
   const req = e.request;
   if (req.method !== 'GET') return;
   const url = new URL(req.url);
+
+  // Cross-origin (e.g. Supabase auth/REST) — never intercept or cache. Let the
+  // network handle it so cloud-sync reads are always live, never a stale snapshot.
+  if (url.origin !== self.location.origin) return;
 
   // Navigations: try the network briefly (so a deployed update is seen), but
   // fall back fast to the cached shell — keeps cold/slow launches instant.

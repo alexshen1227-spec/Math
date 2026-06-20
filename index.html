@@ -5,7 +5,7 @@
 <!-- Defense-in-depth: everything is self-hosted, so lock the app to same-origin.
      'unsafe-inline' is required for the inline app script/styles; img allows data: for
      dynamically-built icons. No remote origins are permitted. -->
-<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self'; manifest-src 'self'; worker-src 'self'; base-uri 'self'; form-action 'self' mailto:; object-src 'none'" />
+<meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; font-src 'self'; connect-src 'self' https://*.supabase.co wss://*.supabase.co; manifest-src 'self'; worker-src 'self'; base-uri 'self'; form-action 'self' mailto:; object-src 'none'" />
 <meta name="viewport" content="width=device-width, initial-scale=1.0, viewport-fit=cover" />
 <meta name="theme-color" content="#0A0A0A" />
 <meta name="description" content="Learn math, practice, and actually get better. Built to understand." />
@@ -29,6 +29,10 @@
 <link rel="stylesheet" href="assets/katex.min.css" />
 <script defer src="assets/katex.min.js"></script>
 <script defer src="assets/auto-render.min.js"></script>
+
+<!-- Supabase client (optional cloud sync) — self-hosted & version-pinned (2.108.2).
+     Stays inert unless you fill in SUPABASE_URL/ANON_KEY in the app config (see SYNC_SETUP.md). -->
+<script defer src="assets/supabase.min.js"></script>
 
 <!-- Static Tailwind replacement: Preflight base reset (offline-first; no CDN) -->
 <style id="ax-preflight">
@@ -4251,6 +4255,16 @@ window.AXIOM_COURSES_2 = [
 (function(){
 'use strict';
 
+// ================================================================
+// ☁  CLOUD SYNC CONFIG  —  paste your two Supabase keys here.
+//    Leave them blank and the app behaves exactly as before (100%
+//    local, no accounts). Full setup steps live in SYNC_SETUP.md.
+//    The anon key is meant to be public; Row-Level Security is what
+//    protects your data, so it is safe to commit these.
+// ================================================================
+var SUPABASE_URL      = 'https://rhgiljlvovdykergzchy.supabase.co';
+var SUPABASE_ANON_KEY = 'sb_publishable__npi45ezb1tGJlmWciXbGg_uj_7M_Tn';   // public publishable key; RLS protects the data
+
 // ---- content (merged from injected globals; safe fallbacks) ----
 var ARTICLES   = [].concat(window.AXIOM_ARTICLES_1||[], window.AXIOM_ARTICLES_2||[]);
 var STRATEGIES = (window.AXIOM_STRATEGIES||[]).slice();
@@ -4265,6 +4279,7 @@ var BANKS      = (window.AXIOM_BANKS||[]).slice();
 var STORAGE_KEY = 'axiom.v1';
 var DEFAULT_STATE = {
   tab: 'today',
+  updatedAt: 0,             // ms timestamp of last local change — drives last-write-wins cloud sync
   courseProgress: {},       // { courseId: [bool,...] }  self-healing on length change
   courseFilter: 'all',
   skillStats: {},           // { skillId: { attempts, correct, streak, box, mastery, lastSeen, dueDate } }
@@ -4322,12 +4337,125 @@ function loadState(){
 }
 var _saveTimer=null;
 function saveState(){
+  // stamp the mutation time (skipped while adopting a remote snapshot, so a
+  // pull never looks "newer than itself" and ping-pongs back to the cloud)
+  if(!SYNC.adopting()) state.updatedAt = now();
   // debounce writes so rapid practice answers don't thrash localStorage
   if(_saveTimer) clearTimeout(_saveTimer);
   _saveTimer = setTimeout(function(){
     try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){}
+    SYNC.pushSoon();   // no-op unless signed in to cloud sync
   }, 120);
 }
+
+// ================================================================
+// CLOUD SYNC  (optional — Supabase). Inert unless SUPABASE_URL +
+// SUPABASE_ANON_KEY are set above. Strategy: one JSON row per user,
+// whole-document last-write-wins by state.updatedAt. Pull on launch,
+// on focus, and on reconnect; debounced push on every save.
+// ================================================================
+var SYNC = (function(){
+  var supa=null, session=null, _email=null;
+  var pushTimer=null, pulling=false, lastSyncedAt=0;
+  var statusKind='idle', statusText='', _adopting=false;
+
+  function configured(){ return !!(SUPABASE_URL && SUPABASE_ANON_KEY && window.supabase && window.supabase.createClient); }
+  function online(){ return navigator.onLine!==false; }
+
+  function fmtAgo(ts){ if(!ts) return ''; var s=Math.round((Date.now()-ts)/1000);
+    if(s<5) return 'just now'; if(s<60) return s+'s ago';
+    var m=Math.round(s/60); if(m<60) return m+'m ago';
+    var h=Math.round(m/60); if(h<24) return h+'h ago'; return Math.round(h/24)+'d ago'; }
+
+  function setStatus(kind,text){ statusKind=kind; statusText=text;
+    var s=el('sync-status'); if(s){ s.textContent=text; s.dataset.kind=kind; } }
+  function markSynced(){ lastSyncedAt=Date.now(); setStatus('ok','✓ Synced · '+fmtAgo(lastSyncedAt)); }
+
+  function init(){
+    if(!configured()) return;
+    try{
+      supa = window.supabase.createClient(SUPABASE_URL, SUPABASE_ANON_KEY, {
+        auth:{ persistSession:true, autoRefreshToken:true, detectSessionInUrl:false, storageKey:'axiom.sb.auth' }
+      });
+    }catch(e){ supa=null; return; }
+    // fires for restored sessions, fresh sign-ins, and magic-link redirects
+    supa.auth.onAuthStateChange(function(ev, sess){
+      session=sess||null; _email = sess&&sess.user&&sess.user.email || null;
+      if(session){ setStatus('idle','Connecting…'); pullNow(); } else { setStatus('idle',''); }
+      refreshSyncPanel();
+    });
+    supa.auth.getSession().then(function(r){
+      session = r&&r.data&&r.data.session || null;
+      _email = session&&session.user&&session.user.email || null;
+      if(session) pullNow();
+      refreshSyncPanel();
+    }, function(){});
+    // re-pull when the user comes back / reconnects so other-device edits show up
+    document.addEventListener('visibilitychange', function(){ if(!document.hidden && session) pullNow(); });
+    window.addEventListener('online', function(){ if(session){ setStatus('idle','Reconnecting…'); pullNow(); } });
+  }
+
+  function pullNow(){
+    if(!supa || !session || pulling) return;
+    if(!online()){ setStatus('offline','Offline — will sync when back online'); return; }
+    pulling=true; setStatus('syncing','Syncing…');
+    supa.from('axiom_state').select('data,updated_at').eq('user_id', session.user.id).maybeSingle()
+      .then(function(res){
+        pulling=false;
+        if(res.error){ setStatus('error','Sync error'); return; }
+        var remote = res.data && res.data.data || null;
+        var rTs = remote && typeof remote.updatedAt==='number' ? remote.updatedAt : 0;
+        var lTs = typeof state.updatedAt==='number' ? state.updatedAt : 0;
+        if(remote && rTs > lTs){ adopt(remote); markSynced(); }
+        else { pushNow(); }   // local is newer, or no remote row yet → seed/refresh the cloud
+      }, function(){ pulling=false; setStatus('error','Sync error'); });
+  }
+
+  // Replace local state with a remote snapshot. We persist the raw row and run
+  // it back through loadState() — the exact type-checked merge used on every
+  // launch — so map-shaped keys (skillStats, courseProgress, achievements) are
+  // preserved and a malformed row can never corrupt or crash the app.
+  function adopt(remote){
+    _adopting=true;
+    try{
+      var ts = typeof remote.updatedAt==='number' ? remote.updatedAt : now();
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(remote));
+      state=loadState(); state.updatedAt=ts;
+      migrateAllStats(); applyAccent(); applyMotion(); refreshStreakUI(); updateHeaderProgress();
+      try{ if(RENDERERS[state.tab]) RENDERERS[state.tab](); }catch(e){}
+      toast('Synced from your other device');
+    }catch(e){}
+    _adopting=false;
+  }
+
+  function pushSoon(){ if(!supa || !session) return; if(pushTimer) clearTimeout(pushTimer); pushTimer=setTimeout(pushNow, 1500); }
+  function pushNow(){
+    if(!supa || !session) return;
+    if(!online()){ setStatus('offline','Offline — will sync when back online'); return; }
+    if(pushTimer){ clearTimeout(pushTimer); pushTimer=null; }
+    setStatus('syncing','Saving…');
+    var payload={ user_id:session.user.id, data:state, updated_at:new Date(state.updatedAt||now()).toISOString() };
+    supa.from('axiom_state').upsert(payload, { onConflict:'user_id' })
+      .then(function(res){ if(res.error){ setStatus('error','Sync error'); } else { markSynced(); } },
+            function(){ setStatus('error','Sync error'); });
+  }
+
+  // ---- auth: email + password (no redirect/email, so it works inside an
+  //      installed PWA on every device, incl. iOS where storage is isolated) ----
+  function signIn(email,password){ if(!supa) return Promise.reject(new Error('not configured'));
+    return supa.auth.signInWithPassword({ email:email, password:password }); }
+  function signUp(email,password){ if(!supa) return Promise.reject(new Error('not configured'));
+    return supa.auth.signUp({ email:email, password:password }); }
+  function signOut(){ if(supa) supa.auth.signOut(); session=null; _email=null; setStatus('idle',''); refreshSyncPanel(); }
+
+  return {
+    init:init, pushSoon:pushSoon, pullNow:pullNow,
+    signIn:signIn, signUp:signUp, signOut:signOut,
+    configured:configured, adopting:function(){ return _adopting; },
+    isSignedIn:function(){ return !!session; }, email:function(){ return _email; },
+    status:function(){ return { kind:statusKind, text:statusText || (lastSyncedAt?'✓ Synced · '+fmtAgo(lastSyncedAt):'') }; }
+  };
+})();
 
 // ================================================================
 // SMALL HELPERS
@@ -6623,11 +6751,12 @@ function openSettings(){
     + toggleRow('reduceMotion','Reduce motion','Calmer animations',s.reduceMotion)
     + '<div class="micro" id="accent-label" style="margin:18px 0 8px">ACCENT COLOR</div><div class="flex flex-wrap gap-3 mb-2" role="radiogroup" aria-labelledby="accent-label">'
       + accentDot('violet','#7C5CFF')+accentDot('cyan','#22D3EE')+accentDot('emerald','#34D399')+accentDot('amber','#FBBF24')+accentDot('rose','#FB7185')+accentDot('yellow','#FFEB00')+'</div>'
+    + '<div id="sync-panel">'+syncPanelHTML()+'</div>'
     + '<div class="micro" style="margin:22px 0 8px">YOUR DATA</div>'
     + '<button class="btn-ghost w-full rounded-xl py-3 text-sm mb-2" data-act="exportData">Export progress (JSON)</button>'
     + '<button class="btn-ghost w-full rounded-xl py-3 text-sm mb-2" data-act="importData">Import progress</button>'
     + '<button class="w-full rounded-xl py-3 text-sm" style="background:rgba(255,59,48,0.12);color:#FF3B30;border:1px solid rgba(255,59,48,0.3)" data-act="resetData">Reset everything</button>'
-    + '<div class="card-2 p-4 mt-5"><div class="micro micro-accent mb-1">PRIVACY</div><div style="font-size:13px;color:#cfcfcf;line-height:1.5">Stored locally on this device. No accounts. No tracking.</div></div>'
+    + '<div class="card-2 p-4 mt-5"><div class="micro micro-accent mb-1">PRIVACY</div><div style="font-size:13px;color:#cfcfcf;line-height:1.5">Stored on your device. No tracking. Turn on cloud sync above to also keep a private copy in your own Supabase account — locked to you by row-level security, so only you can read it.</div></div>'
     + '<button class="btn-ghost w-full rounded-xl py-3 text-sm mt-4" data-act="emailAlex">✉ Email Alex</button>'
     + '<div class="micro" style="text-align:center;margin-top:18px">AXIOM v1.5 · BY ALEX SHEN</div>'
     + '<div class="micro" style="text-align:center;margin-top:4px;color:#8f8f8f">∴ Get genuinely good at math</div>'
@@ -6636,6 +6765,74 @@ function openSettings(){
   var wrap=document.createElement('div'); wrap.innerHTML=html; el('overlays').appendChild(wrap); _sheetWrap=wrap; refreshBgInert(); focusFirstIn(wrap);
   var ni=el('set-name'); if(ni){ ni.addEventListener('input', function(){ state.profile=state.profile||{}; state.profile.name=ni.value.trim()||null; saveState(); }); }
   var rr=el('set-retention'); if(rr){ rr.addEventListener('input', function(){ var v=clamp(parseInt(rr.value,10)||90,80,97); state.settings.targetRetention=v/100; var rv=el('ret-val'); if(rv) rv.textContent=v+'%'; saveState(); }); }
+  wireSyncInputs();
+}
+// (re)bind Enter-to-submit on the sync inputs — called from openSettings AND
+// refreshSyncPanel, since the latter replaces the panel's innerHTML on auth changes
+function wireSyncInputs(){
+  function onEnter(id){ var n=el(id); if(n){ n.addEventListener('keydown', function(e){ if(e.key==='Enter'){ e.preventDefault(); syncSignIn(); } }); } }
+  onEnter('sync-email'); onEnter('sync-pass');
+}
+// ---- cloud-sync settings panel (rendered inside Settings; safe when sync is off) ----
+function syncPanelHTML(){
+  if(!SYNC.configured()){
+    return '<div class="micro" style="margin:22px 0 8px">SYNC ACROSS DEVICES</div>'
+      + '<div class="card-2 p-4"><div style="font-size:13px;color:#cfcfcf;line-height:1.5">Cloud sync isn’t set up yet. Follow <strong style="color:#fff">SYNC_SETUP.md</strong> to connect a free Supabase project — then your progress follows you across phone &amp; desktop automatically.</div></div>';
+  }
+  if(SYNC.isSignedIn()){
+    var st=SYNC.status();
+    return '<div class="micro" style="margin:22px 0 8px">SYNC ACROSS DEVICES</div>'
+      + '<div class="card-2 p-4">'
+      +   '<div style="font-size:13px"><span style="color:#9a9a9a">Signed in as</span><br><strong style="color:#fff">'+escapeHtml(SYNC.email()||'')+'</strong></div>'
+      +   '<div id="sync-status" data-kind="'+st.kind+'" class="micro" style="margin-top:8px;text-transform:none;letter-spacing:0;font-size:12px;min-height:14px">'+escapeHtml(st.text||'Connected')+'</div>'
+      +   '<div class="flex gap-2 mt-3">'
+      +     '<button class="btn-ghost rounded-xl py-2.5 text-sm" style="flex:1" data-act="syncNow">Sync now</button>'
+      +     '<button class="btn-ghost rounded-xl py-2.5 text-sm" style="flex:1" data-act="syncSignOut">Sign out</button>'
+      +   '</div>'
+      + '</div>';
+  }
+  return '<div class="micro" style="margin:22px 0 8px">SYNC ACROSS DEVICES</div>'
+    + '<div class="card-2 p-4">'
+    +   '<div style="font-size:13px;color:#cfcfcf;line-height:1.5;margin-bottom:10px">Sign in to keep your progress in sync across every device. Use the <strong style="color:#fff">same email &amp; password</strong> on each one. First time? Create an account.</div>'
+    +   '<input id="sync-email" class="search-input" type="email" inputmode="email" autocomplete="email" placeholder="you@email.com" />'
+    +   '<input id="sync-pass" class="search-input" type="password" autocomplete="current-password" placeholder="Password (min 6 characters)" style="margin-top:8px" />'
+    +   '<div id="sync-status" data-kind="idle" class="micro" style="margin-top:8px;text-transform:none;letter-spacing:0;font-size:12px;min-height:14px"></div>'
+    +   '<button id="sync-primary" class="btn-accent w-full rounded-xl py-3 text-sm font-bold mt-2" data-act="syncSignIn">Sign in</button>'
+    +   '<button class="btn-ghost w-full rounded-xl py-2.5 text-sm mt-2" data-act="syncSignUp">Create account</button>'
+    + '</div>';
+}
+function refreshSyncPanel(){ var p=el('sync-panel'); if(p){ p.innerHTML=syncPanelHTML(); wireSyncInputs(); } }
+function setSyncMsg(t){ var s=el('sync-status'); if(s) s.textContent=t; }
+function syncCreds(){
+  var em=el('sync-email'), pw=el('sync-pass'); if(!em||!pw) return null;
+  var email=(em.value||'').trim(), pass=pw.value||'';
+  if(!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)){ setSyncMsg('Enter a valid email'); em.focus(); return null; }
+  if(pass.length<6){ setSyncMsg('Password must be at least 6 characters'); pw.focus(); return null; }
+  return { email:email, pass:pass };
+}
+function friendlyAuthErr(e){
+  var m=(e&&e.message)||'Something went wrong';
+  if(/invalid login credentials/i.test(m)) return 'Wrong email or password — or no account yet (tap Create account).';
+  if(/already registered|already exists|user already/i.test(m)) return 'That email already has an account — tap Sign in.';
+  if(/confirm|not confirmed/i.test(m)) return 'Email confirmation is on — turn off “Confirm email” in Supabase, then try again.';
+  return m;
+}
+function syncSignIn(){
+  var c=syncCreds(); if(!c) return;
+  setSyncMsg('Signing in…');
+  SYNC.signIn(c.email,c.pass).then(function(r){
+    if(r && r.error){ setSyncMsg(friendlyAuthErr(r.error)); return; }
+    setSyncMsg('Signed in! Syncing…');   // onAuthStateChange refreshes the panel + pulls
+  }, function(err){ setSyncMsg((err&&err.message)||'Could not sign in'); });
+}
+function syncSignUp(){
+  var c=syncCreds(); if(!c) return;
+  setSyncMsg('Creating account…');
+  SYNC.signUp(c.email,c.pass).then(function(r){
+    if(r && r.error){ setSyncMsg(friendlyAuthErr(r.error)); return; }
+    if(r && r.data && !r.data.session){ setSyncMsg('Account created. Now tap Sign in. (If it wants email confirmation, turn off “Confirm email” in Supabase.)'); return; }
+    setSyncMsg('Account created! Syncing…');   // session present → onAuthStateChange pulls
+  }, function(err){ setSyncMsg((err&&err.message)||'Could not create account'); });
 }
 function toggleRow(key,label,sub,on){
   return '<div class="flex items-center justify-between py-3" style="border-bottom:1px solid rgba(255,255,255,0.06)">'
@@ -6763,6 +6960,10 @@ function handleAct(act, arg, target){
     case 'exportData': exportData(); break;
     case 'importData': importData(); break;
     case 'resetData': resetData(); break;
+    case 'syncSignIn': syncSignIn(); break;
+    case 'syncSignUp': syncSignUp(); break;
+    case 'syncNow': SYNC.pullNow(); break;
+    case 'syncSignOut': SYNC.signOut(); break;
     case 'emailAlex': window.location.href='mailto:alexshen1227@gmail.com?subject=Axiom%20feedback'; break;
     case 'openOnboarding': openOnboarding(); break;
     case 'applyUpdate': applyUpdate(); break;
@@ -6826,15 +7027,21 @@ function importData(){
         var data=JSON.parse(r.result);
         if(!data || typeof data!=='object' || Array.isArray(data)) throw new Error('shape');
         // Sanitize against DEFAULT_STATE: copy only known keys whose type matches,
-        // so a malformed/hostile file can't corrupt state or crash the app.
+        // so a malformed/hostile file can't corrupt state or crash the app. This
+        // mirrors loadState() — map-shaped keys (skillStats/courseProgress/
+        // achievements default to {}) are assigned whole, never key-by-key, or
+        // their contents would be silently dropped.
         var clean=deepClone(DEFAULT_STATE);
         for(var k in DEFAULT_STATE){ if(!Object.prototype.hasOwnProperty.call(data,k)) continue;
           var dv=data[k], def=DEFAULT_STATE[k];
-          if(Array.isArray(def)){ if(Array.isArray(dv)) clean[k]=dv; }
-          else if(def && typeof def==='object'){ if(dv && typeof dv==='object' && !Array.isArray(dv)){ for(var s in def){ if(s in dv) clean[k][s]=dv[s]; } } }
+          if(k==='settings'){ if(dv && typeof dv==='object' && !Array.isArray(dv)){ for(var s in def){ if((s in dv) && typeof dv[s]===typeof def[s]) clean.settings[s]=dv[s]; } } }
+          else if(Array.isArray(def)){ if(Array.isArray(dv)) clean[k]=dv; }
+          else if(def && typeof def==='object'){ if(dv && typeof dv==='object' && !Array.isArray(dv)) clean[k]=dv; }
           else if(typeof dv===typeof def){ clean[k]=dv; }
         }
-        localStorage.setItem(STORAGE_KEY, JSON.stringify(clean)); state=loadState(); migrateAllStats(); applyAccent(); applyMotion(); refreshStreakUI(); updateHeaderProgress(); closeSheet(); showTab('today'); toast('Progress imported');
+        localStorage.setItem(STORAGE_KEY, JSON.stringify(clean)); state=loadState();
+        state.updatedAt=now(); saveState();   // an explicit import wins: stamp fresh + push so the cloud can't overwrite it
+        migrateAllStats(); applyAccent(); applyMotion(); refreshStreakUI(); updateHeaderProgress(); closeSheet(); showTab('today'); toast('Progress imported');
       }catch(e){ toast('Invalid file'); } };
     r.readAsText(f); };
   inp.click();
@@ -6924,6 +7131,27 @@ function applyAccent(){ document.documentElement.dataset.accent = (state.setting
 
 RENDERERS = { today:renderToday, learn:renderLearn, practice:renderPractice, library:renderLibrary, progress:renderProgress };
 
+// One-time upgrade for pre-sync installs: they have updatedAt=0, which always
+// "loses" last-write-wins and would let a fresh/emptier cloud row clobber real
+// local progress on the first pull. If there IS local progress, give it a
+// timestamp derived from last activity (so a more-recently-used device outranks
+// a stale one). Untouched/default installs stay at 0 so a new device correctly
+// pulls. Writes localStorage directly to avoid saveState() re-stamping to now().
+function stampLegacyProgress(){
+  if(state.updatedAt) return;
+  var hasProgress = (state.solvedTotal>0) || state.hasOnboarded
+    || (state.skillStats && Object.keys(state.skillStats).length>0)
+    || (state.activeDays && state.activeDays.length>0);
+  if(!hasProgress) return;
+  var d=null;
+  if(state.streak && state.streak.lastActiveDate) d=state.streak.lastActiveDate;
+  if(state.activeDays && state.activeDays.length){ var la=state.activeDays[state.activeDays.length-1]; if(!d || la>d) d=la; }
+  if(state.history && state.history.length){ var h=state.history[state.history.length-1]; if(h && h.date && (!d || h.date>d)) d=h.date; }
+  var ts=now();
+  if(d){ var p=String(d).split('-').map(Number); var t=Date.UTC(p[0],(p[1]||1)-1,p[2]||1); if(t>0) ts=t+12*3600000; }
+  state.updatedAt=ts;
+  try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){}
+}
 function migrateAllStats(){
   // ensure every stored skill stat has the v2 adaptive fields (statFor migrates lazily,
   // but the render/diagnostics layer reads stats directly)
@@ -6949,6 +7177,8 @@ function init(){
   if(params.review){ setTimeout(startReview, 300); }
   // retro-unlock any achievements already earned by existing progress (silent for fresh users)
   checkAchievements();
+  stampLegacyProgress();   // give pre-sync progress a real timestamp before the first pull
+  SYNC.init();   // restore any cloud session + pull (no-op unless configured & signed in)
   if(!state.hasOnboarded && state.solvedTotal===0){ setTimeout(openOnboarding, standalone?2200:400); }
 }
 // KaTeX may still be loading; re-render current tab once it's ready.
