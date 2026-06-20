@@ -4372,7 +4372,8 @@ function mergeStates(local, remote){
   var ls=local.streak||{}, rs=remote.streak||{}, lAct=ls.lastActiveDate||'', rAct=rs.lastActiveDate||'';
   var newerS = rAct>lAct ? rs : ls;
   out.streak={ current:newerS.current||0, longest:Math.max(ls.longest||0, rs.longest||0), lastActiveDate:(lAct>rAct?lAct:rAct)||null };
-  out.streakFreezes=(typeof prefer.streakFreezes==='number')?prefer.streakFreezes:Math.max(local.streakFreezes||0, remote.streakFreezes||0);
+  var freezeSrc=(newerS===rs)?remote:local;   // tie freezes to the SAME snapshot as streak.current, so a spent freeze isn't silently refunded
+  out.streakFreezes=(typeof freezeSrc.streakFreezes==='number')?freezeSrc.streakFreezes:Math.max(local.streakFreezes||0, remote.streakFreezes||0);
   // per-skill stats: keep whichever copy is more practiced (tie → more recently seen)
   out.skillStats={}; var sids={}; for(k in (local.skillStats||{})) sids[k]=1; for(k in (remote.skillStats||{})) sids[k]=1;
   for(k in sids){ var a=(local.skillStats||{})[k], b=(remote.skillStats||{})[k];
@@ -4457,12 +4458,16 @@ var SYNC = (function(){
         // a clean row), so neither account contaminates the other.
         if(state._syncUser && state._syncUser!==uid){
           if(remote){ adoptMerged(setUser(mergeStates(deepClone(DEFAULT_STATE), remote), uid)); }
-          else { state=loadState(); state._syncUser=uid; state.updatedAt=now(); persistLocal(); pushNow(); }
+          else { adoptMerged(setUser(deepClone(DEFAULT_STATE), uid)); state.updatedAt=now(); persistLocal(); pushNow(); }   // new account, no cloud row → start clean (not the previous account's data)
           markSynced(); return;
         }
         if(!remote){ state._syncUser=uid; state.updatedAt=state.updatedAt||now(); persistLocal(); pushNow(); markSynced(); return; }  // first sync from this device → seed cloud
-        // Steady state: merge so progress only ever grows; push if the cloud is missing anything.
-        var merged = setUser(mergeStates(state, remote), uid);
+        // First sign-in on this device with an existing cloud account: union local progress
+        // UP, but let the account's saved PREFERENCES (level/track/goal/settings) win over this
+        // device's still-default ones — zero the local clock so remote is "newer" for prefs.
+        var lForMerge = state;
+        if(!state._syncUser){ lForMerge=deepClone(state); lForMerge.updatedAt=0; }
+        var merged = setUser(mergeStates(lForMerge, remote), uid);
         var changedLocal = !sameState(merged, state);
         var changedRemote = !sameState(merged, remote);
         if(changedLocal){ adoptMerged(merged); toast('Synced'); }
@@ -4813,6 +4818,7 @@ function sconst(n){ n=+n; if(n===0) return ''; return (n<0?' - ':' + ')+Math.abs
 function byDiff(diff, arr){ return arr[clamp(diff|0,0,arr.length-1)]; }
 // a sign that is +1 until `from`, then randomly ±1 — negatives are a difficulty lever
 function dsign(rng, diff, from){ return (diff>=(from==null?2:from) && rng()<0.5) ? -1 : 1; }
+function ordinal(n){ var v=n%100; var s=(v>=11&&v<=13)?'th':(['th','st','nd','rd'][n%10]||'th'); return n+s; }   // 1st, 2nd, 21st, 23rd…
 var GEN = {};
 
 GEN['add-multi'] = function(rng,diff){
@@ -5139,13 +5145,14 @@ GEN['distribute'] = function(rng,diff){
 };
 GEN['arithmetic-sequence'] = function(rng,diff){
   var a1=ri(rng,byDiff(diff,[1,1,-3,-6,-9]),byDiff(diff,[6,9,12,15,20])), d=ri(rng,2,byDiff(diff,[4,5,7,9,12]))*dsign(rng,diff,3), n=ri(rng,4,byDiff(diff,[6,8,10,15,25])); var ans=a1+(n-1)*d;
-  return { promptTeX:'\\text{A sequence starts at }'+a1+'\\text{ and goes up by }'+d+'\\text{ each step. The }'+n+'\\text{th term?}', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
-    solutionTeX:'$a_{'+n+'} = '+a1+' + ('+n+'-1)\\times'+d+' = '+a1+' + '+((n-1)*d)+' = '+ans+'$.',
-    hints:['Each term adds '+d+' to the one before.','$a_n = a_1 + (n-1)d$.'] };
+  var dir = d<0 ? ('goes down by '+Math.abs(d)) : ('goes up by '+d);
+  return { promptTeX:'\\text{A sequence starts at }'+a1+'\\text{ and '+dir+' each step. The '+ordinal(n)+' term?}', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
+    solutionTeX:'$a_{'+n+'} = '+a1+' + ('+n+'-1)\\times('+d+') = '+a1+' + '+((n-1)*d)+' = '+ans+'$.',
+    hints:[(d<0?'Each term subtracts '+Math.abs(d)+'.':'Each term adds '+d+' to the one before.'),'$a_n = a_1 + (n-1)d$.'] };
 };
 GEN['circle-area'] = function(rng,diff){
   var r=ri(rng,2,byDiff(diff,[5,7,10,15,20])); var k=r*r; var ans=k*Math.PI;
-  return { promptTeX:'\\text{Area of a circle with radius }'+r+'?\\text{ (leave in terms of }\\pi)', answer:k+'\\pi', plain:k+'pi', accept:function(v){return acceptNumeric(v,ans);},
+  return { promptTeX:'\\text{Area of a circle with radius }'+r+'?\\text{ (leave in terms of }\\pi)', answer:k+'\\pi', plain:k+'pi', accept:function(v){ var val; try{ val=evalExpr(v); }catch(e){ return false; } return isFinite(val) && Math.abs(val-ans) <= Math.max(0.05, Math.abs(ans)*0.004); },   // accept "25pi", "25π", or a rounded decimal
     solutionTeX:'$A = \\pi r^2 = \\pi\\times'+r+'^2 = '+k+'\\pi$.',
     hints:['$A = \\pi r^2$.','Square the radius, then multiply by $\\pi$.'] };
 };
@@ -5597,14 +5604,19 @@ function applyMotion(){ document.body.classList.toggle('reduce-motion', motionOf
 // ================================================================
 // STREAK — consecutive days with any completed practice/lesson.
 // ================================================================
+// Regenerate a streak freeze at most once per 7 days (cap 2). Called at launch BEFORE
+// checkStreakBroken (so the break-check sees the post-grant balance) and on activity. A
+// brand-new account (lastFreezeGrant null) just seeds the window — it keeps its starting
+// freeze instead of jumping straight to 2.
+function grantFreezeIfDue(){
+  var t=todayStr();
+  if(!state.lastFreezeGrant){ state.lastFreezeGrant=t; return; }
+  if(dayDiff(t, state.lastFreezeGrant)>=7){ state.streakFreezes=Math.min(2,(state.streakFreezes||0)+1); state.lastFreezeGrant=t; }
+}
 function markActiveToday(){
   var t=todayStr(); var s=state.streak;
   if(state.activeDays.indexOf(t)<0) state.activeDays.push(t);
-  // regenerate a streak freeze at most once per 7 days (cap 2) — a gentle,
-  // local safety net so one busy day doesn't erase weeks of momentum.
-  if(!state.lastFreezeGrant || dayDiff(t, state.lastFreezeGrant)>=7){
-    state.streakFreezes = Math.min(2, (state.streakFreezes||0)+1); state.lastFreezeGrant = t;
-  }
+  grantFreezeIfDue();   // a gentle, local safety net so one busy day doesn't erase weeks of momentum
   if(s.lastActiveDate===t) return; // already counted today
   if(s.lastActiveDate){
     var d=dayDiff(t, s.lastActiveDate);
@@ -5983,11 +5995,13 @@ function mountPotd(){
     var potdIt={type:'input', skillId:_potd.skill.id};
     h+='<input id="potd-input" class="answer-input" inputmode="'+inputModeFor(potdIt)+'" autocomplete="off" autocapitalize="off" spellcheck="false" aria-label="Your answer to the problem of the day" placeholder="your answer" />';
     h+='<div class="micro" style="text-align:center;margin-top:8px;text-transform:none;letter-spacing:0;font-size:11px;color:var(--muted)">'+escapeHtml(formatHintFor(potdIt))+'</div>';
+    h+=keypadFor(potdIt);   // same symbol keypad as a practice session (POTD pool has symbol-heavy skills)
     h+='<button class="btn-accent w-full rounded-xl py-3 text-sm mt-3" data-act="checkPotd">Check answer</button>';
   } else {
     h+='<div id="potd-result"></div>';
   }
   mount.innerHTML=h;
+  var pin=el('potd-input'); if(pin){ pin.addEventListener('keydown',function(e){ if(e.key==='Enter'){ e.preventDefault(); checkPotd(); } }); }
   if(dp.attempted) showPotdSolution();
   autoRenderMath(mount);
 }
@@ -6309,7 +6323,7 @@ function keypadFor(it){
     + '</div>';
 }
 function insertAtCaret(k){
-  var inp=el('ans'); if(!inp) return;
+  var inp=el('ans')||el('potd-input'); if(!inp) return;   // works for both a session and the daily problem
   var st=(inp.selectionStart==null?inp.value.length:inp.selectionStart), en=(inp.selectionEnd==null?inp.value.length:inp.selectionEnd);
   var v=inp.value; inp.value=v.slice(0,st)+k+v.slice(en);
   var pos=st+k.length; try{ inp.setSelectionRange(pos,pos); }catch(e){} inp.focus();
@@ -6467,7 +6481,9 @@ function endSession(){
   // placement quiz → estimate a starting level, seed the track, custom result
   if(session.kind==='placement' && total>0){
     var lvl=clamp(Math.round(session.placeTier||2),1,5);   // staircase already reflects every answer; no extra accuracy nudge (avoids double-counting the last answer)
-    (session.ids||[]).forEach(function(id){ var st=statFor(id); st.theta=clamp((lvl-3)*0.9,-2,2); st.tier=lvl; });   // calibrate the tested skills to the placed level (seedLevel only seeds untested ones)
+    (session.ids||[]).forEach(function(id){ var st=statFor(id); var target=clamp((lvl-3)*0.9,-2,2);   // calibrate tested skills to the placed level (seedLevel only seeds untested ones)
+      if((st.attempts||0)>3){ st.theta=st.theta*0.5+target*0.5; st.tier=clamp(Math.round((st.tier+lvl)/2),1,5); }   // blend — don't nuke a well-practiced skill on a recalibrate
+      else { st.theta=target; st.tier=lvl; } });
     seedLevel(lvl); state.hasOnboarded=true; checkAchievements(); saveState();
     closeSheet(); confetti(140);
     var lname=['Building basics','Getting started','On your way','Strong','Advanced'][lvl-1];
@@ -7271,6 +7287,9 @@ function resetData(){
 // ================================================================
 // GLOBAL EVENT WIRING
 // ================================================================
+// keep the answer field focused when a keypad key is tapped (prevents the mobile
+// soft-keyboard from flickering/closing on every symbol)
+document.addEventListener('pointerdown', function(e){ if(e.target.closest('.kp-key')) e.preventDefault(); }, {passive:false});
 document.addEventListener('click', function(e){
   // math keypad symbol insertion
   var kp=e.target.closest('.kp-key');
@@ -7382,6 +7401,7 @@ function init(){
   buildGlossIndex();
   refreshStreakUI();
   stampLegacyProgress();   // stamp pre-sync progress BEFORE checkStreakBroken — a freeze-spend would otherwise saveState() and re-stamp updatedAt=now()
+  grantFreezeIfDue();      // regenerate any due freeze BEFORE the break-check reads the balance (else a recoverable streak is lost)
   checkStreakBroken();
   updateHeaderProgress();
   // splash only in standalone
