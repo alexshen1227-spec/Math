@@ -6987,6 +6987,12 @@ function openSettings(){
     +   '<div class="text-center"><div class="num" style="font-size:24px;font-weight:800">'+goal+'</div><div class="micro" style="font-size:10px">PROBLEMS / DAY</div></div>'
     +   '<button class="step-btn" data-act="incGoal" aria-label="Increase daily goal">+</button>'
     + '</div>'
+    + '<div class="micro" style="margin:18px 0 8px">GRADE LEVEL</div>'
+    + '<select id="set-grade" class="search-input" aria-label="Grade level" style="width:100%">'
+    +   '<option value=""'+((!state.profile||!state.profile.grade)?' selected':'')+'>Not set</option>'
+    +   GRADES.map(function(g){ return '<option value="'+g.id+'"'+((state.profile&&state.profile.grade===g.id)?' selected':'')+'>'+escapeHtml(g.label)+'</option>'; }).join('')
+    + '</select>'
+    + '<div class="micro" style="font-size:9.5px;margin-top:4px;text-transform:none;letter-spacing:0">Re-seeds your starting difficulty &amp; focus for skills you haven’t practiced yet.</div>'
     + '<div class="micro" style="margin:18px 0 8px">FOCUS TRACK</div>'
     + '<div class="grid grid-cols-2 gap-2">'
       + Object.keys(TRACKS).map(function(k){ var t=TRACKS[k]; var on=state.track===k;
@@ -7020,6 +7026,7 @@ function openSettings(){
   var wrap=document.createElement('div'); wrap.innerHTML=html; el('overlays').appendChild(wrap); _sheetWrap=wrap; refreshBgInert(); focusFirstIn(wrap);
   var ni=el('set-name'); if(ni){ ni.addEventListener('input', function(){ state.profile=state.profile||{}; state.profile.name=ni.value.trim()||null; saveState(); }); }
   var rr=el('set-retention'); if(rr){ rr.addEventListener('input', function(){ var v=clamp(parseInt(rr.value,10)||90,80,97); state.settings.targetRetention=v/100; var rv=el('ret-val'); if(rv) rv.textContent=v+'%'; saveState(); }); }
+  var sg=el('set-grade'); if(sg){ sg.addEventListener('change', function(){ setGrade(sg.value); }); }
   wireSyncInputs();
 }
 // (re)bind Enter-to-submit on the sync inputs — called from openSettings AND
@@ -7274,6 +7281,15 @@ function checkPotd(){
 }
 function toggleSetting(key){ state.settings[key]=!state.settings[key]; saveState(); if(key==='reduceMotion') applyMotion(); openSettings(); if(key==='sound'&&state.settings.sound) chimeOk(); if(key==='confetti'&&state.settings.confetti) confetti(70); }
 function setAccent(name){ state.settings.accent=name; document.documentElement.dataset.accent=name; saveState(); openSettings(); }
+function setGrade(id){
+  var g=gradeById(id); if(!g) return;
+  state.profile=state.profile||{}; state.profile.grade=g.id;
+  state.track=g.track;
+  var trackCourseFilter={ foundations:'Foundations', algebra:'Algebra', geometry:'Geometry & Trig', calculus:'Calculus', reasoning:'Reasoning', all:'all' };
+  state.courseFilter=trackCourseFilter[g.track]||'all';
+  seedLevel(g.lvl);   // re-seeds untested skills to the new level + sets state.level (practiced skills keep their hard-won rating)
+  saveState(); openSettings(); toast('Set to '+g.label);
+}
 function exportData(){
   // stamp a schema version so a future import can migrate older files
   var payload={}; for(var k in state) payload[k]=state[k]; payload._schema=1; payload._exportedAt=todayStr();
