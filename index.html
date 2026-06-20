@@ -4405,6 +4405,7 @@ var SYNC = (function(){
   var supa=null, session=null, _email=null;
   var pushTimer=null, pulling=false, lastSyncedAt=0;
   var statusKind='idle', statusText='', _adopting=false;
+  var channel=null, channelUser=null, lastPushAt=0;
 
   function configured(){ return !!(SUPABASE_URL && SUPABASE_ANON_KEY && window.supabase && window.supabase.createClient); }
   function online(){ return navigator.onLine!==false; }
@@ -4428,19 +4429,33 @@ var SYNC = (function(){
     // fires for restored sessions, fresh sign-ins, and magic-link redirects
     supa.auth.onAuthStateChange(function(ev, sess){
       session=sess||null; _email = sess&&sess.user&&sess.user.email || null;
-      if(session){ setStatus('idle','Connecting…'); pullNow(); } else { setStatus('idle',''); }
+      if(session){ setStatus('idle','Connecting…'); pullNow(); subscribeRealtime(); } else { setStatus('idle',''); }
       refreshSyncPanel();
     });
     supa.auth.getSession().then(function(r){
       session = r&&r.data&&r.data.session || null;
       _email = session&&session.user&&session.user.email || null;
-      if(session) pullNow();
+      if(session){ pullNow(); subscribeRealtime(); }
       refreshSyncPanel();
     }, function(){});
     // re-pull when the user comes back / reconnects so other-device edits show up
-    document.addEventListener('visibilitychange', function(){ if(!document.hidden && session) pullNow(); });
-    window.addEventListener('online', function(){ if(session){ setStatus('idle','Reconnecting…'); pullNow(); } });
-    setInterval(function(){ if(session && !document.hidden) pullNow(); }, 20000);   // keep both open devices in step (reads only; pushes when something changed)
+    document.addEventListener('visibilitychange', function(){ if(!document.hidden && session){ pullNow(); subscribeRealtime(); } });
+    window.addEventListener('online', function(){ if(session){ setStatus('idle','Reconnecting…'); pullNow(); subscribeRealtime(); } });
+    setInterval(function(){ if(session && !document.hidden) pullNow(); }, 20000);   // poll fallback in case Realtime isn't enabled
+  }
+  // Instant cross-device sync: subscribe to this user's row and pull on any change.
+  // Degrades gracefully — if Realtime isn't enabled on the table, the 20s poll covers it.
+  function subscribeRealtime(){
+    if(!supa || !session) return;
+    if(channel && channelUser===session.user.id) return;   // already subscribed for this user
+    try{ if(channel) supa.removeChannel(channel); }catch(e){}
+    channel=null; channelUser=session.user.id;
+    try{
+      channel = supa.channel('axiom-'+channelUser)
+        .on('postgres_changes', { event:'*', schema:'public', table:'axiom_state', filter:'user_id=eq.'+channelUser },
+            function(){ if(Date.now()-lastPushAt > 1500) pullNow(); })   // skip the echo of our own just-pushed write
+        .subscribe();
+    }catch(e){ channel=null; }
   }
 
   function pullNow(){
@@ -4502,7 +4517,7 @@ var SYNC = (function(){
     if(!supa || !session) return;
     if(!online()){ setStatus('offline','Offline — will sync when back online'); return; }
     if(pushTimer){ clearTimeout(pushTimer); pushTimer=null; }
-    setStatus('syncing','Saving…');
+    setStatus('syncing','Saving…'); lastPushAt=Date.now();
     var payload={ user_id:session.user.id, data:state, updated_at:new Date(state.updatedAt||now()).toISOString() };
     supa.from('axiom_state').upsert(payload, { onConflict:'user_id' })
       .then(function(res){ if(res.error){ setStatus('error','Sync error'); } else { markSynced(); } },
@@ -4517,6 +4532,7 @@ var SYNC = (function(){
     return supa.auth.signUp({ email:email, password:password }); }
   function signOut(){
     if(supa) supa.auth.signOut();
+    try{ if(channel) supa.removeChannel(channel); }catch(e){} channel=null; channelUser=null;
     session=null; _email=null;
     try{ localStorage.removeItem(STORAGE_KEY); }catch(e){}   // safe in the cloud; clear this device so the next account starts clean
     state=loadState(); state._syncUser=null;

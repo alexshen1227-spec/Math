@@ -31,10 +31,15 @@ alter table public.axiom_state enable row level security;
 create policy "read own row"   on public.axiom_state for select using      (auth.uid() = user_id);
 create policy "insert own row" on public.axiom_state for insert with check (auth.uid() = user_id);
 create policy "update own row" on public.axiom_state for update using      (auth.uid() = user_id) with check (auth.uid() = user_id);
+
+-- (optional) instant cross-device sync: stream row changes over Realtime.
+-- Without this it still syncs, just on a ~20s poll / when you re-open the app.
+alter publication supabase_realtime add table public.axiom_state;
 ```
 
 Row-Level Security (RLS) is what makes this safe: even though the anon key is
-public, **only the signed-in owner can read or write their own row**.
+public, **only the signed-in owner can read or write their own row**. Realtime
+respects RLS too, so you only ever receive your own row's changes.
 
 ## 3. Turn off email confirmation (instant sign-up, no email needed)
 
