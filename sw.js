@@ -9,7 +9,7 @@
    glyphs and all — works offline on a cold first launch with zero
    third-party runtime dependencies.
    ============================================================ */
-const CACHE_VERSION = 'axiom-v1.6.0';
+const CACHE_VERSION = 'axiom-v1.7.0';
 const CACHE = CACHE_VERSION;
 
 // Complete app shell — everything needed to render fully offline.

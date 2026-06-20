@@ -4295,7 +4295,7 @@ var DEFAULT_STATE = {
   goals: null,
   hasOnboarded: false,
   // personalization + gamification (v1.1)
-  profile: { name: null },
+  profile: { name: null, grade: null },
   xp: 0,                    // lifetime experience points → drives Level
   dailyGoal: 10,            // problems/day target shown as a ring on Today
   achievements: {},         // { achievementId: unlockTimestamp }
@@ -5234,6 +5234,21 @@ var TRACKS = {
   reasoning:    { id:'reasoning',    name:'Reasoning',      icon:'🧠', desc:'Logic, probability, statistics',        topics:['Reasoning','Probability','Logic & Proof','Problem Solving','Statistics'] }
 };
 function currentTrack(){ return TRACKS[state.track] || TRACKS.all; }
+
+// Grade bands → starting difficulty level (1-5) + a suggested focus track. Axiom is built
+// for middle school and up (6th grade+); onboarding asks your grade and seeds from it.
+var GRADES = [
+  { id:'6',     label:'6th grade',                lvl:1, track:'foundations', sub:'Fractions, decimals, ratios, basic stats' },
+  { id:'7',     label:'7th grade',                lvl:2, track:'foundations', sub:'Negative numbers, proportions, percents' },
+  { id:'8',     label:'8th grade',                lvl:3, track:'foundations', sub:'Linear equations, exponents, Pythagoras' },
+  { id:'alg1',  label:'9th · Algebra 1',          lvl:3, track:'algebra',     sub:'Solving equations, factoring, slope, systems' },
+  { id:'geo',   label:'10th · Geometry',          lvl:3, track:'geometry',    sub:'Area, the Pythagorean theorem, coordinates' },
+  { id:'alg2',  label:'11th · Algebra 2',         lvl:4, track:'algebra',     sub:'Quadratics, sequences, functions' },
+  { id:'calc',  label:'12th · Pre-calc / Calculus', lvl:5, track:'calculus',  sub:'Limits, derivatives, integrals' },
+  { id:'adult', label:'Out of school',            lvl:3, track:'all',         sub:'Brushing up — we’ll adapt to you fast' }
+];
+function gradeById(id){ for(var i=0;i<GRADES.length;i++){ if(GRADES[i].id===id) return GRADES[i]; } return null; }
+function levelWord(lvl){ return lvl<=2?'Beginner':(lvl===3?'Intermediate':'Advanced'); }
 
 // problem-of-the-day pool: generator skills only (need a fresh item each day)
 var POTD_POOL = GEN_META.map(function(m){return m[0];}).filter(function(id){
@@ -7073,7 +7088,7 @@ function accentDot(name,color){
 // ---- onboarding ----
 function openOnboarding(){
   closeSheet();
-  var step={n:1, level:null, levelNum:null, track:'all', name:(state.profile&&state.profile.name)||''};
+  var step={n:1, level:null, levelNum:null, track:'all', grade:null, name:(state.profile&&state.profile.name)||''};
   function render(){
     var html;
     if(step.n===1){
@@ -7082,16 +7097,12 @@ function openOnboarding(){
         + '<div style="color:var(--text-mid,#9a9a9a);text-align:center;font-size:14px;margin-top:6px">Let’s find your starting point.</div>'
         + '<div class="micro" style="margin:22px 0 8px">YOUR NAME (OPTIONAL)</div>'
         + '<input id="ob-name" class="search-input" aria-label="Your name" placeholder="What should we call you?" value="'+escapeHtml(step.name||'')+'" />'
-        + '<div class="micro" style="margin:18px 0 6px">WHERE ARE YOU WITH MATH?</div>'
-        + '<div style="color:var(--text-low,#8a8a8a);font-size:11.5px;margin:0 0 10px">Pick the closest — it sets your starting difficulty. You can recalibrate anytime.</div>'
-        + [['New to this','Beginner',1,'Building number sense: addition, times tables, simple fractions'],
-           ['A bit rusty','Beginner',2,'Arithmetic and basic fractions — but it has been a while'],
-           ['Comfortable','Intermediate',3,'Fractions, percents, and solving equations like 2x + 5 = 11'],
-           ['Confident','Advanced',4,'Factoring, quadratics, systems of equations, slope'],
-           ['Advanced','Advanced',5,'Calculus: derivatives, limits, and integrals']].map(function(o){
-            return '<button class="card-2 p-3 text-left mb-2 w-full" data-ob-level="'+o[1]+'" data-ln="'+o[2]+'">'
-              + '<div style="font-size:14px;font-weight:700">'+escapeHtml(o[0])+'</div>'
-              + '<div class="micro" style="font-size:10px;margin-top:2px;text-transform:none;letter-spacing:0;color:var(--text-mid,#9a9a9a)">'+escapeHtml(o[3])+'</div></button>'; }).join('')
+        + '<div class="micro" style="margin:18px 0 6px">WHAT GRADE ARE YOU IN?</div>'
+        + '<div style="color:var(--text-low,#8a8a8a);font-size:11.5px;margin:0 0 10px">This sets where you start — Axiom adapts to every answer from there. You can change it anytime.</div>'
+        + GRADES.map(function(g){
+            return '<button class="card-2 p-3 text-left mb-2 w-full" data-ob-grade="'+g.id+'">'
+              + '<div style="font-size:14px;font-weight:700">'+escapeHtml(g.label)+'</div>'
+              + '<div class="micro" style="font-size:10px;margin-top:2px;text-transform:none;letter-spacing:0;color:var(--text-mid,#9a9a9a)">'+escapeHtml(g.sub)+'</div></button>'; }).join('')
         + '<button class="w-full text-sm mt-2" style="color:var(--text-low,#a6a6a6)" data-ob-skip>Skip for now</button></div>';
     } else {
       html='<div class="p-6"><div style="font-size:20px;font-weight:800">Choose a focus</div>'
@@ -7109,11 +7120,11 @@ function openOnboarding(){
     wrap.innerHTML='<div class="backdrop"></div><div class="sheet" role="dialog" aria-modal="true" aria-label="Onboarding">'+html+'</div>';
     closeSheet(); el('overlays').appendChild(wrap); _sheetWrap=wrap; refreshBgInert(); focusFirstIn(wrap);
     wrap.addEventListener('click',function(e){
-      var t=e.target.closest('[data-ob-level],[data-ob-skip],[data-ob-track],[data-ob-done],[data-ob-place]');
+      var t=e.target.closest('[data-ob-grade],[data-ob-skip],[data-ob-track],[data-ob-done],[data-ob-place]');
       if(!t) return;
       var ni=el('ob-name'); if(ni) step.name=ni.value.trim();   // keep name when advancing
       if(t.hasAttribute('data-ob-skip')){ finishOnboarding(step); }
-      else if(t.hasAttribute('data-ob-level')){ step.level=t.getAttribute('data-ob-level'); step.levelNum=parseInt(t.getAttribute('data-ln'),10)||2; step.n=2; render(); }
+      else if(t.hasAttribute('data-ob-grade')){ var g=gradeById(t.getAttribute('data-ob-grade')); if(g){ step.grade=g.id; step.levelNum=g.lvl; step.track=g.track; step.level=levelWord(g.lvl); } step.n=2; render(); }
       else if(t.hasAttribute('data-ob-track')){ step.track=t.getAttribute('data-ob-track'); render(); }
       else if(t.hasAttribute('data-ob-place')){ finishOnboarding(step, true); }
       else if(t.hasAttribute('data-ob-done')){ finishOnboarding(step); }
@@ -7125,6 +7136,7 @@ function finishOnboarding(step, placement){
   state.hasOnboarded=true;
   state.profile = state.profile || {};
   state.profile.name = (step.name||'').trim() || null;
+  if(step.grade) state.profile.grade = step.grade;
   state.track = step.track || 'all';
   state.goals={ level:step.level||'Beginner', focus:[] };
   var trackCourseFilter={ foundations:'Foundations', algebra:'Algebra', geometry:'Geometry & Trig', calculus:'Calculus', reasoning:'Reasoning', all:'all' };
