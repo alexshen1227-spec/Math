@@ -124,7 +124,7 @@ img,video{max-width:100%;height:auto;}
   #nav-indicator{ position:absolute; top:0; height:3px; border-radius:0 0 3px 3px; background:var(--accent);
     box-shadow:0 0 12px rgba(var(--accent-rgb),0.9); transition: transform .34s cubic-bezier(.22,1,.36,1); }
   .nav-btn{ color:#9a9a9a; transition:color .2s ease; }
-  .nav-btn.active{ color:var(--accent); }
+  .nav-btn.active{ color:var(--accent-text, var(--accent)); }
   .nav-btn.active svg{ filter:drop-shadow(0 0 8px rgba(var(--accent-rgb),0.5)); }
 
   /* ---- splash ---- */
@@ -190,7 +190,7 @@ img,video{max-width:100%;height:auto;}
 
   .callout{ border-left:3px solid var(--accent); background:rgba(var(--accent-rgb),0.08); border-radius:0 10px 10px 0;
     padding:.7rem .85rem; margin:0 0 1rem; }
-  .callout .lab{ font-family:'JetBrains Mono',monospace; font-weight:700; text-transform:uppercase; font-size:9.5px; letter-spacing:.22em; color:var(--accent); display:block; margin-bottom:.3rem; }
+  .callout .lab{ font-family:'JetBrains Mono',monospace; font-weight:700; text-transform:uppercase; font-size:9.5px; letter-spacing:.22em; color:var(--accent-text, var(--accent)); display:block; margin-bottom:.3rem; }
   .callout p{ margin:0; color:#e5e5e5; }
   .callout.warn{ border-left-color:#fbbf24; background:rgba(251,191,36,0.10); }
   .callout.warn .lab{ color:#fbbf24; }
@@ -203,7 +203,7 @@ img,video{max-width:100%;height:auto;}
     padding:.9rem 0; margin:1.2rem 0; font-size:1.1rem; font-weight:600; line-height:1.45; color:#fff; }
   .sources{ border-top:1px solid rgba(255,255,255,0.12); margin-top:1.4rem; padding-top:.8rem; }
   .sources .lab{ font-family:'JetBrains Mono',monospace; font-weight:700; text-transform:uppercase; font-size:9.5px; letter-spacing:.22em; color:var(--muted); display:block; margin-bottom:.4rem; }
-  .sources a{ color:var(--accent); text-decoration:none; display:block; font-size:.85rem; margin:.25rem 0; }
+  .sources a{ color:var(--accent-text, var(--accent)); text-decoration:none; display:block; font-size:.85rem; margin:.25rem 0; }
   .sources a:active{ opacity:.7; }
 
   .video-card{ display:flex; gap:10px; align-items:center; background:#1C1C1C; border:1px solid rgba(255,255,255,0.08); border-radius:12px; padding:10px; margin:0 0 1rem; text-decoration:none; }
@@ -340,7 +340,7 @@ img,video{max-width:100%;height:auto;}
 
   /* within-session combo pill */
   .combo-pill{ font-family:'JetBrains Mono',monospace; font-weight:800; font-size:11px; letter-spacing:.02em;
-    padding:3px 9px; border-radius:999px; background:rgba(var(--accent-rgb),0.16); color:var(--accent);
+    padding:3px 9px; border-radius:999px; background:rgba(var(--accent-rgb),0.16); color:var(--accent-text, var(--accent));
     border:1px solid rgba(var(--accent-rgb),0.34); line-height:1; animation:pop .35s ease; }
 
   /* floating "+N XP" reward on a correct answer */
@@ -4282,6 +4282,8 @@ var DEFAULT_STATE = {
   tab: 'today',
   updatedAt: 0,             // ms timestamp of last local change — drives last-write-wins cloud sync
   courseProgress: {},       // { courseId: [bool,...] }  self-healing on length change
+  courseRewarded: {},       // { courseId: [bool,...] }  days already paid XP — toggling can't re-mint
+  courseCompleted: {},      // { courseId: timestamp }   course already paid its completion bonus
   courseFilter: 'all',
   skillStats: {},           // { skillId: { attempts, correct, streak, box, mastery, lastSeen, dueDate } }
   solvedTotal: 0, correctTotal: 0,
@@ -4383,6 +4385,13 @@ function mergeStates(local, remote){
   out.courseProgress={}; var cids={}; for(k in (local.courseProgress||{})) cids[k]=1; for(k in (remote.courseProgress||{})) cids[k]=1;
   for(k in cids){ var la=(local.courseProgress||{})[k]||[], ra=(remote.courseProgress||{})[k]||[], len=Math.max(la.length,ra.length), arr=new Array(len);
     for(var i=0;i<len;i++) arr[i]=!!(la[i]||ra[i]); out.courseProgress[k]=arr; }
+  // course reward-tracking: OR each day's rewarded flag, union completed courses (earliest) — so a
+  // merge never lets a course pay its XP twice across devices
+  out.courseRewarded={}; var rids={}; for(k in (local.courseRewarded||{})) rids[k]=1; for(k in (remote.courseRewarded||{})) rids[k]=1;
+  for(k in rids){ var lr=(local.courseRewarded||{})[k]||[], rr2=(remote.courseRewarded||{})[k]||[], rlen=Math.max(lr.length,rr2.length), rarr=new Array(rlen);
+    for(var ri2=0;ri2<rlen;ri2++) rarr[ri2]=!!(lr[ri2]||rr2[ri2]); out.courseRewarded[k]=rarr; }
+  out.courseCompleted={}; var ccid={}; for(k in (local.courseCompleted||{})) ccid[k]=1; for(k in (remote.courseCompleted||{})) ccid[k]=1;
+  for(k in ccid){ var lc2=(local.courseCompleted||{})[k], rc2=(remote.courseCompleted||{})[k]; out.courseCompleted[k]=(lc2&&rc2)?Math.min(lc2,rc2):(lc2||rc2); }
   // achievements: union, earliest unlock time wins
   out.achievements={}; var aid={}; for(k in (local.achievements||{})) aid[k]=1; for(k in (remote.achievements||{})) aid[k]=1;
   for(k in aid){ var lt=(local.achievements||{})[k], rt=(remote.achievements||{})[k]; out.achievements[k]=(lt&&rt)?Math.min(lt,rt):(lt||rt); }
@@ -4518,10 +4527,10 @@ var SYNC = (function(){
     if(!supa || !session) return;
     if(!online()){ setStatus('offline','Offline — will sync when back online'); return; }
     if(pushTimer){ clearTimeout(pushTimer); pushTimer=null; }
-    setStatus('syncing','Saving…'); lastPushAt=Date.now();
+    setStatus('syncing','Saving…');
     var payload={ user_id:session.user.id, data:state, updated_at:new Date(state.updatedAt||now()).toISOString() };
     supa.from('axiom_state').upsert(payload, { onConflict:'user_id' })
-      .then(function(res){ if(res.error){ setStatus('error','Sync error'); } else { markSynced(); } },
+      .then(function(res){ if(res.error){ setStatus('error','Sync error'); } else { lastPushAt=Date.now(); markSynced(); } },
             function(){ setStatus('error','Sync error'); });
   }
 
@@ -4906,7 +4915,7 @@ GEN['order-of-operations'] = function(rng,diff){
 };
 GEN['negatives'] = function(rng,diff){
   var mag=byDiff(diff,[6,9,12,20,40]);
-  var mode = diff<=1 ? ri(rng,0,1) : ri(rng,0,2);   // hold back the (harder) negative×negative mode at the easiest levels
+  var mode = diff<=1 ? (rng()<0.5?0:2) : ri(rng,0,2);   // hold back the (harder) negative×negative mode (mode 1) at the easiest levels
   if(mode===0){ var a=ri(rng,-mag,-1), b=ri(rng,2,mag); var ans=a+b;
     return { promptTeX:'('+a+') + '+b+' = \\;?', answer:String(ans), accept:function(x){return acceptNumeric(x,ans);},
       solutionTeX:'Start at $'+a+'$ and move $'+b+'$ to the right: $'+ans+'$.', hints:['Use the number line.','Adding a positive moves right.'] }; }
@@ -5188,6 +5197,61 @@ GEN['median'] = function(rng,diff){
     solutionTeX:'In order: $'+sorted.join(',\\,')+'$. The middle value is $'+ans+'$.',
     hints:['Sort the numbers first.','The median is the middle value.'] };
 };
+GEN['square-root'] = function(rng,diff){
+  var n=ri(rng, byDiff(diff,[2,4,6,9,13]), byDiff(diff,[6,9,12,20,30])); var sq=n*n;
+  return { promptTeX:'\\sqrt{'+sq+'} = \\;?', answer:String(n), accept:function(v){return acceptNumeric(v,n);},
+    solutionTeX:'$\\sqrt{'+sq+'} = '+n+'$ because $'+n+'\\times'+n+' = '+sq+'$.',
+    hints:['What number times itself gives '+sq+'?','Think of the perfect squares: 4, 9, 16, 25, …'] };
+};
+GEN['volume-prism'] = function(rng,diff){
+  var l=ri(rng,2,byDiff(diff,[5,7,10,15,20])), w=ri(rng,2,byDiff(diff,[5,7,10,15,20])), h=ri(rng,2,byDiff(diff,[5,7,10,12,15])); var ans=l*w*h;
+  return { promptTeX:'\\text{Volume of a }'+l+'\\times'+w+'\\times'+h+'\\text{ box?}', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
+    solutionTeX:'$V = l\\times w\\times h = '+l+'\\times'+w+'\\times'+h+' = '+ans+'$.',
+    hints:['Multiply length × width × height.','$'+l+'\\times'+w+'\\times'+h+'$'] };
+};
+GEN['circumference'] = function(rng,diff){
+  var r=ri(rng,2,byDiff(diff,[5,7,10,15,20])); var k=2*r; var ans=k*Math.PI;
+  return { promptTeX:'\\text{Circumference of a circle with radius }'+r+'?\\text{ (in terms of }\\pi)', answer:k+'\\pi', plain:k+'pi',
+    accept:function(v){ var val; try{ val=evalExpr(v); }catch(e){ return false; } return isFinite(val) && Math.abs(val-ans) <= Math.max(0.05, Math.abs(ans)*0.004); },
+    solutionTeX:'$C = 2\\pi r = 2\\pi\\times'+r+' = '+k+'\\pi$.',
+    hints:['$C = 2\\pi r$.','Double the radius, then multiply by $\\pi$.'] };
+};
+GEN['unit-rate'] = function(rng,diff){
+  var rate=ri(rng,2,byDiff(diff,[8,12,20,40,60])), qty=ri(rng,2,byDiff(diff,[5,6,8,10,12])); var total=rate*qty;
+  return { promptTeX:'\\text{'+total+' miles in '+qty+' hours. Speed in miles per hour?}', answer:String(rate), accept:function(v){return acceptNumeric(v,rate);},
+    solutionTeX:'$'+total+' \\div '+qty+' = '+rate+'$ miles per hour.',
+    hints:['Divide the distance by the time.','$'+total+' \\div '+qty+'$'] };
+};
+GEN['range-stat'] = function(rng,diff){
+  var n=byDiff(diff,[4,4,5,6,7]), hi=byDiff(diff,[20,30,50,80,99]); var nums=[],i; for(i=0;i<n;i++) nums.push(ri(rng,1,hi));
+  var mx=Math.max.apply(null,nums), mn=Math.min.apply(null,nums); var ans=mx-mn;
+  return { promptTeX:'\\text{Range of } '+nums.join(',\\,')+'?', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
+    solutionTeX:'Highest $'+mx+'$ minus lowest $'+mn+'$: $'+mx+' - '+mn+' = '+ans+'$.',
+    hints:['Find the biggest and smallest values.','Range = highest − lowest.'] };
+};
+GEN['mode-stat'] = function(rng,diff){
+  var hi=byDiff(diff,[9,12,15,20,30]), modeVal=ri(rng,1,hi), n=byDiff(diff,[5,5,6,7,7]);
+  var nums=[modeVal,modeVal,modeVal], guard=0;
+  while(nums.length<n && guard++<100){ var v=ri(rng,1,hi); var cnt=0; for(var j=0;j<nums.length;j++) if(nums[j]===v) cnt++; if(v!==modeVal && cnt<2) nums.push(v); }
+  for(var i=nums.length-1;i>0;i--){ var kk=Math.floor(rng()*(i+1)); var t=nums[i]; nums[i]=nums[kk]; nums[kk]=t; }
+  return { promptTeX:'\\text{Mode of } '+nums.join(',\\,')+'?', answer:String(modeVal), accept:function(v){return acceptNumeric(v,modeVal);},
+    solutionTeX:'$'+modeVal+'$ appears most often.',
+    hints:['Which value shows up the most?','That repeated value is the mode.'] };
+};
+GEN['rounding-decimals'] = function(rng,diff){
+  var whole=ri(rng,0,byDiff(diff,[9,20,50,99,500])), dec=ri(rng,1,99); var cents=whole*100+dec; var val=cents/100;
+  var ans=Math.round(cents/10)/10;
+  return { promptTeX:'\\text{Round }'+val.toFixed(2)+'\\text{ to the nearest tenth.}', answer:fmtNum(ans), accept:function(v){return acceptNumeric(v,ans);},
+    solutionTeX:'The hundredths digit decides it: $'+val.toFixed(2)+' \\approx '+fmtNum(ans)+'$.',
+    hints:['Look at the hundredths digit.','5 or more rounds the tenths up.'] };
+};
+GEN['percent-increase'] = function(rng,diff){
+  var base=ri(rng,2,byDiff(diff,[10,20,40,80,150]))*5; var pct=pick(rng, [10,20,25,50,5,15,40].slice(0,byDiff(diff,[2,3,4,6,7])));
+  var ans=base*(1+pct/100);
+  return { promptTeX:'\\text{'+base+' increased by '+pct+'\\%?}', answer:fmtNum(ans), accept:function(v){return acceptNumeric(v,ans);},
+    solutionTeX:'$'+base+'\\times'+((100+pct)/100)+' = '+fmtNum(ans)+'$ — that is $(100+'+pct+')\\%$ of it.',
+    hints:['Add the increase to the original — or take $(100+'+pct+')\\%$.','$'+base+'\\times'+((100+pct)/100)+'$'] };
+};
 
 // ================================================================
 // SKILL REGISTRY — generators + (later) conceptual banks merged in.
@@ -5233,7 +5297,15 @@ var GEN_META = [
   ['arithmetic-sequence','Arithmetic sequences','Algebra','Intermediate'],
   ['circle-area','Area of a circle','Geometry & Trig','Intermediate'],
   ['mean-average','Mean (average)','Statistics','Beginner'],
-  ['median','Median','Statistics','Intermediate']
+  ['median','Median','Statistics','Intermediate'],
+  ['square-root','Square roots','Arithmetic','Intermediate'],
+  ['volume-prism','Volume of a box','Geometry & Trig','Beginner'],
+  ['circumference','Circumference','Geometry & Trig','Intermediate'],
+  ['unit-rate','Unit rates','Fractions','Beginner'],
+  ['range-stat','Range','Statistics','Beginner'],
+  ['mode-stat','Mode','Statistics','Beginner'],
+  ['rounding-decimals','Rounding decimals','Arithmetic','Beginner'],
+  ['percent-increase','Percent increase','Fractions','Intermediate']
 ];
 var SKILLS = [];
 GEN_META.forEach(function(m){ SKILLS.push({ id:m[0], name:m[1], topic:m[2], level:m[3], kind:'gen', gen:GEN[m[0]] }); });
@@ -5244,6 +5316,7 @@ var SKILL_BY_ID = {}; SKILLS.forEach(function(s){ SKILL_BY_ID[s.id]=s; });
 // learning TRACKS — a focus area = a subset of topics the adaptive engine draws from.
 var TRACKS = {
   all:          { id:'all',          name:'Everything',     icon:'🌐', desc:'All topics, fully adaptive',           topics:['Arithmetic','Fractions','Mental Math','Algebra','Geometry & Trig','Calculus','Estimation','Reasoning','Probability','Logic & Proof','Problem Solving'] },
+  core:         { id:'core',         name:'Core skills',    icon:'🎯', desc:'Everything except calculus',           topics:['Arithmetic','Fractions','Mental Math','Algebra','Geometry & Trig','Estimation','Statistics'] },
   foundations:  { id:'foundations',  name:'Foundations',    icon:'🔢', desc:'Arithmetic, fractions, percents',       topics:['Arithmetic','Fractions','Mental Math','Estimation','Statistics'] },
   algebra:      { id:'algebra',      name:'Algebra',        icon:'📐', desc:'Equations, factoring, systems',         topics:['Algebra'] },
   geometry:     { id:'geometry',     name:'Geometry & Trig',icon:'📏', desc:'Shapes, Pythagoras, the unit circle',   topics:['Geometry & Trig'] },
@@ -5257,7 +5330,7 @@ function currentTrack(){ return TRACKS[state.track] || TRACKS.all; }
 var GRADES = [
   { id:'6',     label:'6th grade',                lvl:1, track:'foundations', sub:'Fractions, decimals, ratios, basic stats' },
   { id:'7',     label:'7th grade',                lvl:2, track:'foundations', sub:'Negative numbers, proportions, percents' },
-  { id:'8',     label:'8th grade',                lvl:3, track:'foundations', sub:'Linear equations, exponents, Pythagoras' },
+  { id:'8',     label:'8th grade',                lvl:3, track:'core',        sub:'Linear equations, exponents, Pythagoras' },
   { id:'alg1',  label:'9th · Algebra 1',          lvl:3, track:'algebra',     sub:'Solving equations, factoring, slope, systems' },
   { id:'geo',   label:'10th · Geometry',          lvl:3, track:'geometry',    sub:'Area, the Pythagorean theorem, coordinates' },
   { id:'alg2',  label:'11th · Algebra 2',         lvl:4, track:'algebra',     sub:'Quadratics, sequences, functions' },
@@ -5269,7 +5342,7 @@ function levelWord(lvl){ return lvl<=2?'Beginner':(lvl===3?'Intermediate':'Advan
 
 // problem-of-the-day pool: generator skills only (need a fresh item each day)
 var POTD_POOL = GEN_META.map(function(m){return m[0];}).filter(function(id){
-  return ['add-multi','times-tables','order-of-operations','negatives','simplify-fraction','percent-of','percent-change','solve-linear','expand-foil','factor-trinomial','solve-quadratic','slope-two-points','pythagoras-find','power-rule','simple-limit','square-5','mult-by-11','area-basic','powers-eval','gcf','ratio-proportion','distribute','circle-area','mean-average','percent-discount','abs-value','arithmetic-sequence'].indexOf(id)>=0;
+  return ['add-multi','times-tables','order-of-operations','negatives','simplify-fraction','percent-of','percent-change','solve-linear','expand-foil','factor-trinomial','solve-quadratic','slope-two-points','pythagoras-find','power-rule','simple-limit','square-5','mult-by-11','area-basic','powers-eval','gcf','ratio-proportion','distribute','circle-area','mean-average','percent-discount','abs-value','arithmetic-sequence','square-root','volume-prism','unit-rate','range-stat','mode-stat','rounding-decimals','percent-increase'].indexOf(id)>=0;
 });
 
 // ================================================================
@@ -6008,9 +6081,10 @@ function ensureDailyProblem(){
   var t=todayStr();
   if(state.dailyProblem.date!==t){ state.dailyProblem={date:t, attempted:false, correct:false}; saveState(); }
 }
+function potdPool(){ var t=trackSkillIds(); var p=POTD_POOL.filter(function(id){ return t.indexOf(id)>=0; }); return p.length>=3 ? p : POTD_POOL; }   // keep the daily problem/challenge on-grade for the user's focus
 function getDailyProblem(){
   var t=todayStr(); var seed=hashStr('potd-'+t);
-  var skillId = POTD_POOL[seed % POTD_POOL.length];
+  var pool = potdPool(); var skillId = pool[seed % pool.length];
   var skill = SKILL_BY_ID[skillId];
   var rng = mulberry32(seed);
   var st = statFor(skillId);
@@ -6295,7 +6369,7 @@ function startSession(skillIds, label, limit, kind){
 // date, ordered easy→hard. Completing it grants bonus XP once per day.
 function dailyChallengeIds(){
   var seed=hashStr('challenge-'+todayStr()); var rng=mulberry32(seed);
-  var pool=POTD_POOL.slice(); var ids=[];
+  var pool=potdPool().slice(); var ids=[];
   for(var i=0;i<5 && pool.length;i++){ var k=Math.floor(rng()*pool.length); ids.push(pool.splice(k,1)[0]); }
   ids.sort(function(a,b){ return ((state.skillStats[a]||{box:0}).box)-((state.skillStats[b]||{box:0}).box); });
   return ids;
@@ -6339,7 +6413,7 @@ function formatHintFor(it){
 // skills get the mobile numeric keypad.
 // includes every skill that can produce a NEGATIVE answer — 'decimal' inputmode has no
 // minus key on iOS/Android, so those must use 'text' (full keyboard) or be unanswerable
-var NEEDS_TEXT = {'expand-foil':1,'factor-trinomial':1,'diff-of-squares':1,'solve-quadratic':1,'linear-systems':1,'power-rule':1,'basic-integral':1,'simplify-fraction':1,'add-fractions':1,'multiply-fractions':1,'fdp-convert':1,'slope-two-points':1,'distribute':1,'circle-area':1,'negatives':1,'evaluate-expr':1,'solve-linear':1,'two-step-equation':1,'simple-limit':1,'percent-change':1,'arithmetic-sequence':1};
+var NEEDS_TEXT = {'expand-foil':1,'factor-trinomial':1,'diff-of-squares':1,'solve-quadratic':1,'linear-systems':1,'power-rule':1,'basic-integral':1,'simplify-fraction':1,'add-fractions':1,'multiply-fractions':1,'fdp-convert':1,'slope-two-points':1,'distribute':1,'circle-area':1,'negatives':1,'evaluate-expr':1,'solve-linear':1,'two-step-equation':1,'simple-limit':1,'percent-change':1,'arithmetic-sequence':1,'circumference':1};
 function inputModeFor(it){ return (it && it.type==='input' && !NEEDS_TEXT[it.skillId]) ? 'decimal' : 'text'; }
 // a small symbol keypad for awkward-to-type characters on mobile (per skill type)
 function keypadFor(it){
@@ -6348,7 +6422,7 @@ function keypadFor(it){
   if(/expand-foil|factor-trinomial|diff-of-squares|power-rule|basic-integral|distribute/.test(id)) keys=['x','^','(',')','+','-'];
   else if(/solve-quadratic|linear-systems/.test(id)) keys=['x','y','=',',','-','/'];
   else if(/fraction|fdp-convert|percent|slope-two-points|simplify/.test(id)) keys=['/','-','.'];
-  else if(/circle-area/.test(id)) keys=['π','.'];   // the one skill whose answer is "kπ"
+  else if(/circle-area|circumference/.test(id)) keys=['π','.'];   // answer is "kπ"
   if(!keys) return '';
   return '<div id="keypad" class="flex flex-wrap gap-2 mt-3" role="group" aria-label="Math symbol keypad">'
     + keys.map(function(k){ return '<button type="button" class="kp-key" data-key="'+escapeHtml(k)+'" aria-label="Insert '+escapeHtml(k)+'">'+escapeHtml(k)+'</button>'; }).join('')
@@ -7244,12 +7318,19 @@ function toggleDay(){
   var c=_activeCourse, i=_activeDayIdx; if(!c) return;
   var prog=state.courseProgress[c.id]; var willComplete=!prog[i];
   prog[i]=!prog[i];
+  state.courseRewarded=state.courseRewarded||{}; var rewarded=state.courseRewarded[c.id]=state.courseRewarded[c.id]||[];
+  state.courseCompleted=state.courseCompleted||{};
   if(willComplete){
     chimeOk(); vibrate(18);
     markActiveToday();                 // finishing a lesson keeps the streak alive
+    var firstDay = !rewarded[i];       // XP only the FIRST time a day is completed — toggling can't farm it
     var s=courseStatus(c);
-    if(s.status==='complete'){ awardXp(120); saveState(); checkAchievements(); celebrate('🎓','Course complete!', c.title+' is in the bag.'); renderDay(c,i); return; }
-    awardXp(25); confetti(60);
+    if(s.status==='complete'){
+      if(firstDay) rewarded[i]=true;
+      if(!state.courseCompleted[c.id]){ state.courseCompleted[c.id]=now(); awardXp(120); saveState(); checkAchievements(); celebrate('🎓','Course complete!', c.title+' is in the bag.'); renderDay(c,i); return; }
+      saveState(); renderDay(c,i); return;   // re-completing an already-finished course → no bonus
+    }
+    if(firstDay){ rewarded[i]=true; awardXp(25); confetti(60); }
     var nextPreview = i<c.days.length-1 ? 'Next: '+c.days[i+1].title : 'Last day!';
     toast('Day '+(i+1)+' done · '+escapeHtml(nextPreview));
     checkAchievements();
@@ -7312,6 +7393,7 @@ function importData(){
         for(var k in DEFAULT_STATE){ if(!Object.prototype.hasOwnProperty.call(data,k)) continue;
           var dv=data[k], def=DEFAULT_STATE[k];
           if(k==='settings'){ if(dv && typeof dv==='object' && !Array.isArray(dv)){ for(var s in def){ if((s in dv) && typeof dv[s]===typeof def[s]) clean.settings[s]=dv[s]; } } }
+          else if(def===null){ clean[k]=dv; }   // nullable fields (level, goals, lastFreezeGrant) — mirror loadState so a restore doesn't drop them
           else if(Array.isArray(def)){ if(Array.isArray(dv)) clean[k]=dv; }
           else if(def && typeof def==='object'){ if(dv && typeof dv==='object' && !Array.isArray(dv)) clean[k]=dv; }
           else if(typeof dv===typeof def){ clean[k]=dv; }
@@ -7436,6 +7518,14 @@ function migrateAllStats(){
   // ensure every stored skill stat has the v2 adaptive fields (statFor migrates lazily,
   // but the render/diagnostics layer reads stats directly)
   for(var id in state.skillStats){ if(SKILL_BY_ID[id]) statFor(id); }
+  // any already-completed course day counts as already-rewarded, and a fully-done course as
+  // already-paid — so the new reward guards don't let a returning user re-mint XP by toggling.
+  state.courseRewarded=state.courseRewarded||{}; state.courseCompleted=state.courseCompleted||{};
+  for(var cid in state.courseProgress){ var pr=state.courseProgress[cid]; if(!pr||!pr.length) continue;
+    var rw=state.courseRewarded[cid]=state.courseRewarded[cid]||[]; var allDone=true;
+    for(var di=0;di<pr.length;di++){ if(pr[di]) rw[di]=true; else allDone=false; }
+    if(allDone && !state.courseCompleted[cid]) state.courseCompleted[cid]=now();
+  }
 }
 function init(){
   state=loadState();
