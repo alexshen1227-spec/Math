@@ -4452,6 +4452,7 @@ var SYNC = (function(){
     document.addEventListener('visibilitychange', function(){ if(!document.hidden && session){ pullNow(); subscribeRealtime(); } });
     window.addEventListener('online', function(){ if(session){ setStatus('idle','Reconnecting…'); pullNow(); subscribeRealtime(); } });
     setInterval(function(){ if(session && !document.hidden) pullNow(); }, 20000);   // poll fallback in case Realtime isn't enabled
+    setInterval(function(){ if(session && statusKind==='ok'){ var s=el('sync-status'); if(s) s.textContent='✓ Synced · '+fmtAgo(lastSyncedAt); } }, 10000);   // keep the "synced Xs ago" label live while Settings is open
   }
   // Instant cross-device sync: subscribe to this user's row and pull on any change.
   // Degrades gracefully — if Realtime isn't enabled on the table, the 20s poll covers it.
@@ -5994,7 +5995,7 @@ function renderToday(){
     h+= '<div class="card p-3 mb-3" style="border-color:rgba(96,165,250,0.4);background:rgba(96,165,250,0.08)"><div style="font-size:13.5px;color:#dbeafe">❄️ <strong>Streak saved!</strong> A freeze covered your missed day — you’re on a '+state._freezeJustUsed+'-day streak. 🔥</div></div>';
     state._freezeJustUsed=null; saveState();
   } else if(solvedToday===0 && (state.streak.current||0)>=3){
-    h+= '<button class="card p-3 mb-3 w-full text-left" data-act="startWarmup" style="border-color:rgba(var(--accent-rgb),0.35)"><div style="font-size:13.5px"><span style="color:var(--accent);font-weight:700">🔥 Keep your '+(state.streak.current)+'-day streak alive</span> — just one problem today.'+((state.streakFreezes||0)>0?' <span class="micro" style="text-transform:none;letter-spacing:0">'+state.streakFreezes+' freeze in reserve.</span>':'')+'</div></button>';
+    h+= '<button class="card p-3 mb-3 w-full text-left" data-act="startWarmup" style="border-color:rgba(var(--accent-rgb),0.35)"><div style="font-size:13.5px"><span style="color:var(--accent-text, var(--accent));font-weight:700">🔥 Keep your '+(state.streak.current)+'-day streak alive</span> — just one problem today.'+((state.streakFreezes||0)>0?' <span class="micro" style="text-transform:none;letter-spacing:0">'+state.streakFreezes+' freeze in reserve.</span>':'')+'</div></button>';
   }
 
   // one-time level calibration nudge (existing users who never placed)
