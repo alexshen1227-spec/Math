@@ -2826,7 +2826,7 @@ window.AXIOM_BANKS = [
   {
     id: 'fraction-concept-bank',
     name: 'Fraction concepts',
-    topic: 'Fractions & Ratio',
+    topic: 'Fractions',
     level: 'Beginner',
     items: [
       {
@@ -4354,6 +4354,51 @@ function saveState(){
 // whole-document last-write-wins by state.updatedAt. Pull on launch,
 // on focus, and on reconnect; debounced push on every save.
 // ================================================================
+// Field-aware merge of two whole-state snapshots. Progress is MONOTONIC — counters
+// take the max, logs/sets union, per-skill stats keep the more-practiced copy — so a
+// stale or offline device can never SHRINK the other's progress, only add to it.
+// Preferences (settings/profile/track/level/goal/…) follow whichever snapshot is newer.
+function unionArr(a,b){ var seen={}, out=[]; (a||[]).concat(b||[]).forEach(function(x){ var key=(x&&typeof x==='object')?JSON.stringify(x):String(x); if(!seen[key]){ seen[key]=1; out.push(x); } }); return out; }
+function mergeStates(local, remote){
+  if(!remote || typeof remote!=='object') return deepClone(local);
+  var out=deepClone(local), k;
+  var lTs=(typeof local.updatedAt==='number')?local.updatedAt:0, rTs=(typeof remote.updatedAt==='number')?remote.updatedAt:0;
+  var prefer = rTs>lTs ? remote : local;   // newer snapshot wins preference-type fields
+  out.solvedTotal=Math.max(local.solvedTotal||0, remote.solvedTotal||0);
+  out.correctTotal=Math.max(local.correctTotal||0, remote.correctTotal||0);
+  out.xp=Math.max(local.xp||0, remote.xp||0);
+  // streak: best longest ever; current + lastActiveDate from the more-recently-active snapshot
+  var ls=local.streak||{}, rs=remote.streak||{}, lAct=ls.lastActiveDate||'', rAct=rs.lastActiveDate||'';
+  var newerS = rAct>lAct ? rs : ls;
+  out.streak={ current:newerS.current||0, longest:Math.max(ls.longest||0, rs.longest||0), lastActiveDate:(lAct>rAct?lAct:rAct)||null };
+  out.streakFreezes=(typeof prefer.streakFreezes==='number')?prefer.streakFreezes:Math.max(local.streakFreezes||0, remote.streakFreezes||0);
+  // per-skill stats: keep whichever copy is more practiced (tie → more recently seen)
+  out.skillStats={}; var sids={}; for(k in (local.skillStats||{})) sids[k]=1; for(k in (remote.skillStats||{})) sids[k]=1;
+  for(k in sids){ var a=(local.skillStats||{})[k], b=(remote.skillStats||{})[k];
+    out.skillStats[k] = (a&&b) ? (((b.attempts||0)>(a.attempts||0) || ((b.attempts||0)===(a.attempts||0) && (b.lastSeen||0)>(a.lastSeen||0))) ? b : a) : (a||b); }
+  // course progress: OR each day's done-flag; union of courses
+  out.courseProgress={}; var cids={}; for(k in (local.courseProgress||{})) cids[k]=1; for(k in (remote.courseProgress||{})) cids[k]=1;
+  for(k in cids){ var la=(local.courseProgress||{})[k]||[], ra=(remote.courseProgress||{})[k]||[], len=Math.max(la.length,ra.length), arr=new Array(len);
+    for(var i=0;i<len;i++) arr[i]=!!(la[i]||ra[i]); out.courseProgress[k]=arr; }
+  // achievements: union, earliest unlock time wins
+  out.achievements={}; var aid={}; for(k in (local.achievements||{})) aid[k]=1; for(k in (remote.achievements||{})) aid[k]=1;
+  for(k in aid){ var lt=(local.achievements||{})[k], rt=(remote.achievements||{})[k]; out.achievements[k]=(lt&&rt)?Math.min(lt,rt):(lt||rt); }
+  // append-only sets/logs
+  out.activeDays=unionArr(local.activeDays, remote.activeDays).sort();
+  out.readArticles=unionArr(local.readArticles, remote.readArticles);
+  out.bookmarks={}; var bc={}; for(k in (local.bookmarks||{})) bc[k]=1; for(k in (remote.bookmarks||{})) bc[k]=1;
+  for(k in bc){ out.bookmarks[k]=unionArr((local.bookmarks||{})[k], (remote.bookmarks||{})[k]); }
+  // history: per-date max so a re-synced session never double-counts
+  var hist={}; (local.history||[]).concat(remote.history||[]).forEach(function(h){ if(!h||!h.date) return; var e=hist[h.date]||{date:h.date,solved:0,correct:0}; e.solved=Math.max(e.solved,h.solved||0); e.correct=Math.max(e.correct,h.correct||0); hist[h.date]=e; });
+  out.history=Object.keys(hist).sort().map(function(d){return hist[d];});
+  var snap={}; (local.snapshots||[]).concat(remote.snapshots||[]).forEach(function(s){ if(s&&s.date) snap[s.date]=s; });
+  out.snapshots=Object.keys(snap).sort().map(function(d){return snap[d];});
+  // preference-type fields follow the newer snapshot
+  ['settings','profile','track','level','dailyGoal','courseFilter','librarySub','tab','goals','lastFreezeGrant','dailyProblem'].forEach(function(p){ if(prefer[p]!==undefined) out[p]=deepClone(prefer[p]); });
+  out.hasOnboarded=!!(local.hasOnboarded || remote.hasOnboarded);
+  out.updatedAt=Math.max(lTs, rTs);
+  return out;
+}
 var SYNC = (function(){
   var supa=null, session=null, _email=null;
   var pushTimer=null, pulling=false, lastSyncedAt=0;
@@ -4393,6 +4438,7 @@ var SYNC = (function(){
     // re-pull when the user comes back / reconnects so other-device edits show up
     document.addEventListener('visibilitychange', function(){ if(!document.hidden && session) pullNow(); });
     window.addEventListener('online', function(){ if(session){ setStatus('idle','Reconnecting…'); pullNow(); } });
+    setInterval(function(){ if(session && !document.hidden) pullNow(); }, 20000);   // keep both open devices in step (reads only; pushes when something changed)
   }
 
   function pullNow(){
@@ -4404,31 +4450,48 @@ var SYNC = (function(){
         pulling=false;
         if(res.error){ setStatus('error','Sync error'); return; }
         var remote = res.data && res.data.data || null;
-        var rTs = remote && typeof remote.updatedAt==='number' ? remote.updatedAt : 0;
-        var lTs = typeof state.updatedAt==='number' ? state.updatedAt : 0;
-        if(remote && rTs > lTs){ adopt(remote); markSynced(); }
-        else { pushNow(); }   // local is newer, or no remote row yet → seed/refresh the cloud
+        var uid = session.user.id;
+        // Account switch: a DIFFERENT account is signing in on this device. Never
+        // merge this account's data into another — take the remote as-is (or seed
+        // a clean row), so neither account contaminates the other.
+        if(state._syncUser && state._syncUser!==uid){
+          if(remote){ adoptMerged(setUser(mergeStates(deepClone(DEFAULT_STATE), remote), uid)); }
+          else { state=loadState(); state._syncUser=uid; state.updatedAt=now(); persistLocal(); pushNow(); }
+          markSynced(); return;
+        }
+        if(!remote){ state._syncUser=uid; state.updatedAt=state.updatedAt||now(); persistLocal(); pushNow(); markSynced(); return; }  // first sync from this device → seed cloud
+        // Steady state: merge so progress only ever grows; push if the cloud is missing anything.
+        var merged = setUser(mergeStates(state, remote), uid);
+        var changedLocal = !sameState(merged, state);
+        var changedRemote = !sameState(merged, remote);
+        if(changedLocal){ adoptMerged(merged); toast('Synced'); }
+        else { state._syncUser=uid; state.updatedAt=merged.updatedAt; persistLocal(); }
+        if(changedRemote) pushNow();
+        markSynced();
       }, function(){ pulling=false; setStatus('error','Sync error'); });
   }
-
-  // Replace local state with a remote snapshot. We persist the raw row and run
-  // it back through loadState() — the exact type-checked merge used on every
-  // launch — so map-shaped keys (skillStats, courseProgress, achievements) are
-  // preserved and a malformed row can never corrupt or crash the app.
-  function adopt(remote){
+  function setUser(o, uid){ o._syncUser=uid; return o; }
+  function persistLocal(){ try{ localStorage.setItem(STORAGE_KEY, JSON.stringify(state)); }catch(e){} }
+  // compare two snapshots ignoring updatedAt + volatile _flags, key-order-independent
+  function stableStr(v){ if(v===null||typeof v!=='object') return JSON.stringify(v);
+    if(Array.isArray(v)) return '['+v.map(stableStr).join(',')+']';
+    return '{'+Object.keys(v).sort().map(function(k){ return JSON.stringify(k)+':'+stableStr(v[k]); }).join(',')+'}'; }
+  function canon(s){ var o={}; for(var k in s){ if(k==='updatedAt'||k.charAt(0)==='_') continue; o[k]=s[k]; } return stableStr(o); }
+  function sameState(a,b){ return canon(a)===canon(b); }
+  // Install an already-merged snapshot as local state (persist + re-render). Runs it
+  // back through loadState() — the same type-checked merge used on every launch.
+  function adoptMerged(obj){
     _adopting=true;
     try{
-      var ts = typeof remote.updatedAt==='number' ? remote.updatedAt : now();
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(remote));
-      state=loadState(); state.updatedAt=ts;
+      localStorage.setItem(STORAGE_KEY, JSON.stringify(obj));
+      state=loadState(); state.updatedAt=obj.updatedAt; state._syncUser=obj._syncUser;
       migrateAllStats(); applyAccent(); applyMotion(); refreshStreakUI(); updateHeaderProgress();
       try{ if(RENDERERS[state.tab]) RENDERERS[state.tab](); }catch(e){}
-      toast('Synced from your other device');
     }catch(e){}
     _adopting=false;
   }
 
-  function pushSoon(){ if(!supa || !session) return; if(pushTimer) clearTimeout(pushTimer); pushTimer=setTimeout(pushNow, 1500); }
+  function pushSoon(){ if(!supa || !session) return; if(pushTimer) clearTimeout(pushTimer); pushTimer=setTimeout(pushNow, 900); }
   function pushNow(){
     if(!supa || !session) return;
     if(!online()){ setStatus('offline','Offline — will sync when back online'); return; }
@@ -4446,7 +4509,15 @@ var SYNC = (function(){
     return supa.auth.signInWithPassword({ email:email, password:password }); }
   function signUp(email,password){ if(!supa) return Promise.reject(new Error('not configured'));
     return supa.auth.signUp({ email:email, password:password }); }
-  function signOut(){ if(supa) supa.auth.signOut(); session=null; _email=null; setStatus('idle',''); refreshSyncPanel(); }
+  function signOut(){
+    if(supa) supa.auth.signOut();
+    session=null; _email=null;
+    try{ localStorage.removeItem(STORAGE_KEY); }catch(e){}   // safe in the cloud; clear this device so the next account starts clean
+    state=loadState(); state._syncUser=null;
+    migrateAllStats(); applyAccent(); applyMotion(); refreshStreakUI(); updateHeaderProgress();
+    try{ if(RENDERERS[state.tab]) RENDERERS[state.tab](); }catch(e){}
+    setStatus('idle',''); refreshSyncPanel();
+  }
 
   return {
     init:init, pushSoon:pushSoon, pullNow:pullNow,
@@ -4731,31 +4802,40 @@ function fracTeX(p,q){ var g=gcd(p,q); p/=g; q/=g; if(q<0){p=-p;q=-q;} if(q===1)
 function cterm(n, v){ n=+n; if(n===0) return '0'; if(n===1) return v; if(n===-1) return '-'+v; return n+v; }
 function sterm(n, v){ n=+n; if(n===0) return ''; var a=Math.abs(n); return (n<0?' - ':' + ')+((a===1&&v)?'':a)+v; }
 function sconst(n){ n=+n; if(n===0) return ''; return (n<0?' - ':' + ')+Math.abs(n); }
+// ---- difficulty scaling -------------------------------------------------
+// Every generator receives diff 0..4 (mapped 1:1 from the skill's adaptive
+// tier 1..5). byDiff(diff,[a,b,c,d,e]) selects the value for this level, so a
+// generator's difficulty progression is explicit and monotonic. Lower levels
+// MUST stay genuinely easy: keep magnitudes small and hold back negatives /
+// extra structure until higher diff, so an "easy" item is never secretly hard.
+function byDiff(diff, arr){ return arr[clamp(diff|0,0,arr.length-1)]; }
+// a sign that is +1 until `from`, then randomly ±1 — negatives are a difficulty lever
+function dsign(rng, diff, from){ return (diff>=(from==null?2:from) && rng()<0.5) ? -1 : 1; }
 var GEN = {};
 
 GEN['add-multi'] = function(rng,diff){
-  var mag = diff>=2?900:(diff>=1?90:40);
-  var a=ri(rng, diff>=2?100:10, diff>=2?999:99), b=ri(rng, diff>=2?100:10, diff>=2?999:99);
+  var lo=byDiff(diff,[5,10,40,150,800]), hi=byDiff(diff,[20,99,400,999,5000]);
+  var a=ri(rng,lo,hi), b=ri(rng,lo,hi);
   var ans=a+b;
   return { promptTeX:a+' + '+b+' = \\;?', answer:String(ans), accept:function(x){return acceptNumeric(x,ans);},
     solutionTeX:'Add left to right: $'+a+' + '+b+' = '+ans+'$.',
     hints:['Add the big parts first, then the small parts.','$'+a+'+'+b+'$ — line up place values.'] };
 };
 GEN['subtract-multi'] = function(rng,diff){
-  var a=ri(rng, diff>=2?300:30, diff>=2?999:99), b=ri(rng, 1, a-1);
+  var a=ri(rng, byDiff(diff,[10,20,120,300,1500]), byDiff(diff,[20,99,400,999,5000])), b=ri(rng, 1, a-1);
   var ans=a-b;
   return { promptTeX:a+' - '+b+' = \\;?', answer:String(ans), accept:function(x){return acceptNumeric(x,ans);},
     solutionTeX:'Count up from $'+b+'$ to $'+a+'$, or subtract directly: $'+a+'-'+b+'='+ans+'$.',
     hints:['Try counting up from the smaller number.','$'+a+'-'+b+'$'] };
 };
 GEN['times-tables'] = function(rng,diff){
-  var hi=diff>=2?15:12; var a=ri(rng,2,hi), b=ri(rng,2,hi); var ans=a*b;
+  var hi=byDiff(diff,[6,9,12,15,20]); var a=ri(rng,2,hi), b=ri(rng,2,hi); var ans=a*b;
   return { promptTeX:a+' \\times '+b+' = \\;?', answer:String(ans), accept:function(x){return acceptNumeric(x,ans);},
     solutionTeX:'$'+a+' \\times '+b+' = '+ans+'$.',
     hints:['Picture '+a+' rows of '+b+'.','$'+a+'\\times'+b+'$'] };
 };
 GEN['multiply-2digit'] = function(rng,diff){
-  var a=ri(rng,11,diff>=2?99:39), b=ri(rng,11,diff>=2?99:29); var bg=0; while(b%10===0 && bg++<10) b=ri(rng,11,diff>=2?99:29); var ans=a*b;  // nonzero units → no "×0 + 0" tail
+  var ha=byDiff(diff,[19,29,49,79,99]), hb=byDiff(diff,[19,29,39,69,99]); var a=ri(rng,11,ha), b=ri(rng,11,hb); var bg=0; while(b%10===0 && bg++<10) b=ri(rng,11,hb); var ans=a*b;  // nonzero units → no "×0 + 0" tail
   return { promptTeX:a+' \\times '+b+' = \\;?', answer:String(ans), accept:function(x){return acceptNumeric(x,ans);},
     solutionTeX:'Break it up: $'+a+'\\times'+b+' = '+a+'\\times'+Math.floor(b/10)*10+' + '+a+'\\times'+(b%10)+' = '+(a*(Math.floor(b/10)*10))+' + '+(a*(b%10))+' = '+ans+'$.',
     hints:['Split the second number into tens and ones.','$'+a+'\\times'+b+'$'] };
@@ -4763,7 +4843,7 @@ GEN['multiply-2digit'] = function(rng,diff){
 GEN['mult-by-11'] = function(rng,diff){
   // Always a 2-digit number so the "add the digits in the middle" trick is
   // literally what the solution shows; diff>=2 biases toward carry cases.
-  var a=ri(rng, diff>=2?50:12, diff>=2?98:88); var ans=a*11;
+  var a=ri(rng, byDiff(diff,[10,12,23,45,60]), byDiff(diff,[35,55,75,89,98])); var ans=a*11;
   var t=Math.floor(a/10), u=a%10, mid=t+u;
   var sol = mid<10
     ? 'Split the digits of $'+a+'$ and drop their sum in the middle: $'+t+'\\,|\\,'+t+'+'+u+'\\,|\\,'+u+' = '+t+''+mid+''+u+' = '+ans+'$.'
@@ -4775,33 +4855,46 @@ GEN['mult-by-11'] = function(rng,diff){
 GEN['square-5'] = function(rng,diff){
   // Cap n at 9 so the number stays 2-digit (…5) and "the tens digit" in the
   // hint is exactly n; diff>=2 just biases toward the harder 65/75/85/95.
-  var n=ri(rng, diff>=2?5:1, 9); var base=n*10+5; var ans=base*base; var head=n*(n+1);
+  var n=ri(rng, byDiff(diff,[1,2,3,5,7]), 9); var base=n*10+5; var ans=base*base; var head=n*(n+1);
   return { promptTeX:base+'^2 = \\;?', answer:String(ans), accept:function(x){return acceptNumeric(x,ans);},
     solutionTeX:'Numbers ending in 5: $n5^2 = [n(n+1)]25$. Here $n='+n+'$, so $'+n+'\\times'+(n+1)+'='+head+'$, append $25$: $'+ans+'$.',
     hints:['Multiply the tens digit by one more than itself.','Then stick 25 on the end.'] };
 };
 GEN['order-of-operations'] = function(rng,diff){
-  // a + b * c  - d   (no ambiguous implicit/division)
-  var a=ri(rng,2,12), b=ri(rng,2,9), c=ri(rng,2,9), d=ri(rng,1,10);
-  var ans = a + b*c - d;
-  return { promptTeX:a+' + '+b+' \\times '+c+' - '+d+' = \\;?', answer:String(ans), accept:function(x){return acceptNumeric(x,ans);},
-    solutionTeX:'Multiplication first: $'+b+'\\times'+c+'='+(b*c)+'$. Then left to right: $'+a+' + '+(b*c)+' - '+d+' = '+ans+'$.',
+  var hi=byDiff(diff,[5,9,9,12,12]);
+  if(diff>=3){
+    // parentheses first: a(b + c) - d   (d bounded so the result stays non-negative)
+    var a=ri(rng,2,byDiff(diff,[2,2,2,9,12])), b=ri(rng,2,hi), c=ri(rng,2,hi);
+    var prod=a*(b+c), d=ri(rng,1,clamp(prod-1,1,byDiff(diff,[5,5,5,20,40])));
+    var ans=prod-d;
+    return { promptTeX:a+'('+b+' + '+c+') - '+d+' = \\;?', answer:String(ans), accept:function(x){return acceptNumeric(x,ans);},
+      solutionTeX:'Parentheses first: $'+b+'+'+c+'='+(b+c)+'$. Then $'+a+'\\times'+(b+c)+' - '+d+' = '+prod+' - '+d+' = '+ans+'$.',
+      hints:['Do what is inside the parentheses first.','PEMDAS: parentheses, then $\\times$, then $-$.'] };
+  }
+  // a + b * c - d  (no ambiguous implicit/division); d bounded so the answer stays non-negative
+  var a2=ri(rng,2,byDiff(diff,[6,9,12,12,12])), b2=ri(rng,2,hi), c2=ri(rng,2,hi), prod2=b2*c2;
+  var d2=ri(rng,1,clamp(a2+prod2-1,1,byDiff(diff,[5,8,10,10,10])));
+  var ans2=a2+prod2-d2;
+  return { promptTeX:a2+' + '+b2+' \\times '+c2+' - '+d2+' = \\;?', answer:String(ans2), accept:function(x){return acceptNumeric(x,ans2);},
+    solutionTeX:'Multiplication first: $'+b2+'\\times'+c2+'='+prod2+'$. Then left to right: $'+a2+' + '+prod2+' - '+d2+' = '+ans2+'$.',
     hints:['Do the multiplication before the addition.','PEMDAS: $\\times$ before $+$ and $-$.'] };
 };
 GEN['negatives'] = function(rng,diff){
-  var mode=ri(rng,0,2);
-  if(mode===0){ var a=ri(rng,-12,-1), b=ri(rng,3,15); var ans=a+b;
+  var mag=byDiff(diff,[6,9,12,20,40]);
+  var mode = diff<=1 ? ri(rng,0,1) : ri(rng,0,2);   // hold back the (harder) negative×negative mode at the easiest levels
+  if(mode===0){ var a=ri(rng,-mag,-1), b=ri(rng,2,mag); var ans=a+b;
     return { promptTeX:'('+a+') + '+b+' = \\;?', answer:String(ans), accept:function(x){return acceptNumeric(x,ans);},
       solutionTeX:'Start at $'+a+'$ and move $'+b+'$ to the right: $'+ans+'$.', hints:['Use the number line.','Adding a positive moves right.'] }; }
-  if(mode===1){ var c=ri(rng,-9,-2), d=ri(rng,-9,-2); var ans2=c*d;
+  if(mode===1){ var fl=byDiff(diff,[2,2,2,4,6]), fh=byDiff(diff,[4,6,9,12,15]); var c=ri(rng,-fh,-fl), d=ri(rng,-fh,-fl); var ans2=c*d;
     return { promptTeX:'('+c+') \\times ('+d+') = \\;?', answer:String(ans2), accept:function(x){return acceptNumeric(x,ans2);},
       solutionTeX:'Negative times negative is positive: $'+Math.abs(c)+'\\times'+Math.abs(d)+'='+ans2+'$.', hints:['Two negatives make a positive.','Multiply the sizes, fix the sign.'] }; }
-  var e=ri(rng,3,15), f=ri(rng,e+1,e+15); var ans3=e-f;
+  var e=ri(rng,2,mag), f=ri(rng,e+1,e+mag); var ans3=e-f;
   return { promptTeX:e+' - '+f+' = \\;?', answer:String(ans3), accept:function(x){return acceptNumeric(x,ans3);},
     solutionTeX:'$'+e+'-'+f+'='+ans3+'$ — you cross zero into the negatives.', hints:['Subtracting more than you have goes negative.','Move left on the number line.'] };
 };
 GEN['simplify-fraction'] = function(rng,diff){
-  var g=ri(rng,2,9), p=ri(rng,1,9), q=ri(rng,2,12); while(q===1) q=ri(rng,2,12);
+  var qh=byDiff(diff,[5,7,9,12,15]);
+  var g=ri(rng,2,byDiff(diff,[3,4,6,9,12])), p=ri(rng,1,byDiff(diff,[4,6,9,9,12])), q=ri(rng,2,qh); while(q===1) q=ri(rng,2,qh);
   var num=p*g, den=q*g; var gg=gcd(num,den); var rp=num/gg, rq=den/gg;
   return { promptTeX:'\\text{Simplify } \\frac{'+num+'}{'+den+'}', answer:fracTeX(rp,rq), plain:rp+'/'+rq,
     accept:function(x){ return acceptReducedFraction(x, rp, rq); },  // must be in LOWEST terms
@@ -4810,7 +4903,7 @@ GEN['simplify-fraction'] = function(rng,diff){
 };
 GEN['add-fractions'] = function(rng,diff){
   // summands are already in lowest terms (no "1/2 + 3/6"); answer required in lowest terms
-  var b=ri(rng,2,diff>=2?12:8), d=ri(rng,2,diff>=2?12:8);
+  var dh=byDiff(diff,[5,7,9,12,15]); var b=ri(rng,2,dh), d=ri(rng,2,dh);
   var a=ri(rng,1,b-1); var ga=0; while(gcd(a,b)!==1 && ga++<20) a=ri(rng,1,b-1);
   var c=ri(rng,1,d-1); var gc=0; while(gcd(c,d)!==1 && gc++<20) c=ri(rng,1,d-1);
   var num=a*d+c*b, den=b*d; var g=gcd(num,den); var rp=num/g, rq=den/g;
@@ -4820,7 +4913,7 @@ GEN['add-fractions'] = function(rng,diff){
     hints:['Find a common denominator first.','Use $'+b+'\\times'+d+'='+den+'$, then reduce to lowest terms.'] };
 };
 GEN['multiply-fractions'] = function(rng,diff){
-  var b=ri(rng,2,9), d=ri(rng,2,9);
+  var dh=byDiff(diff,[4,6,8,9,12]); var b=ri(rng,2,dh), d=ri(rng,2,dh);
   var a=ri(rng,1,b-1); var ga=0; while(gcd(a,b)!==1 && ga++<20) a=ri(rng,1,b-1);
   var c=ri(rng,1,d-1); var gc=0; while(gcd(c,d)!==1 && gc++<20) c=ri(rng,1,d-1);
   var num=a*c, den=b*d; var g=gcd(num,den); var rp=num/g, rq=den/g;
@@ -4830,8 +4923,8 @@ GEN['multiply-fractions'] = function(rng,diff){
     hints:['Tops times tops, bottoms times bottoms.','Then reduce to lowest terms.'] };
 };
 GEN['fdp-convert'] = function(rng,diff){
-  var mode=ri(rng,0,2);
-  if(mode===0){ var pct=ri(rng,1,19)*5; var dec=pct/100;
+  var mode = diff<=1 ? ri(rng,0,1) : ri(rng,0,2);
+  if(mode===0){ var pct = diff<=0?ri(rng,1,4)*25 : diff<=1?ri(rng,1,10)*10 : ri(rng,1,19)*5; var dec=pct/100;
     return { promptTeX:'\\text{Write }'+pct+'\\%\\text{ as a decimal.}', answer:fmtNum(dec), plain:fmtNum(dec), accept:function(x){return acceptNumeric(x,dec);},
       solutionTeX:'Percent means "per 100": $'+pct+'\\% = '+pct+'/100 = '+fmtNum(dec)+'$.', hints:['Divide by 100.','Move the decimal two places left.'] }; }
   if(mode===1){ var halves=[[1,2,50],[1,4,25],[3,4,75],[1,5,20],[2,5,40],[3,5,60],[1,10,10],[3,10,30],[1,20,5]];
@@ -4845,7 +4938,7 @@ GEN['fdp-convert'] = function(rng,diff){
     solutionTeX:'$'+c[0]+' = \\frac{'+cp+'}{'+cq+'}$.', hints:['Read the decimal as a fraction over a power of 10.','Then reduce to lowest terms.'] };
 };
 GEN['percent-of'] = function(rng,diff){
-  var pct=ri(rng,1,20)*5; var whole=ri(rng,2,diff>=2?40:20)*5; var ans=pct/100*whole;
+  var pct = diff<=1 ? ri(rng,1,10)*10 : ri(rng,1,20)*5; var whole=ri(rng,2,byDiff(diff,[8,16,30,40,60]))*5; var ans=pct/100*whole;
   return { promptTeX:'\\text{What is }'+pct+'\\%\\text{ of }'+whole+'?', answer:fmtNum(ans), accept:function(x){return acceptNumeric(x,ans);},
     solutionTeX:'"of" means times: $'+pct+'\\% \\times '+whole+' = '+(pct/100)+'\\times'+whole+' = '+fmtNum(ans)+'$.',
     hints:['Turn the percent into a decimal, then multiply.','$'+pct+'\\%='+(pct/100)+'$'] };
@@ -4854,7 +4947,7 @@ GEN['percent-change'] = function(rng,diff){
   // larger, more varied pool; harder difficulties bias toward the trickier pairs
   var easy=[[80,100,25],[100,80,-20],[50,75,50],[40,50,25],[20,25,25],[100,150,50],[100,50,-50],[60,90,50]];
   var hard=[[75,60,-20],[60,45,-25],[200,150,-25],[120,150,25],[250,200,-20],[80,140,75],[90,72,-20],[45,54,20],[160,200,25],[140,112,-20]];
-  var pool = diff>=2 ? easy.concat(hard) : easy;
+  var pool = diff>=3 ? easy.concat(hard) : diff>=2 ? easy.concat(hard.slice(0,4)) : easy;
   var c=pick(rng,pool);
   return { promptTeX:'\\text{Percent change from }'+c[0]+'\\text{ to }'+c[1]+'?', answer:c[2]+'\\%', plain:String(c[2]), accept:function(x){return acceptNumeric(String(x).replace('%',''), c[2]);},
     solutionTeX:'$\\frac{'+c[1]+'-'+c[0]+'}{'+c[0]+'} = \\frac{'+(c[1]-c[0])+'}{'+c[0]+'} = '+(c[2]/100)+' = '+c[2]+'\\%$.',
@@ -4862,26 +4955,26 @@ GEN['percent-change'] = function(rng,diff){
 };
 GEN['solve-linear'] = function(rng,diff){
   // a x + b = c, integer solution (a never +-1, b never 0 → no "1x"/"+0")
-  var a=ri(rng,2,9)*(rng()<0.3?-1:1), x=ri(rng,-8,9), b=ri(rng,1,9)*(rng()<0.5?-1:1); var c=a*x+b;
+  var a=ri(rng,2,byDiff(diff,[5,6,9,12,12]))*dsign(rng,diff,2), x=ri(rng,byDiff(diff,[1,-4,-8,-12,-15]),byDiff(diff,[6,8,9,12,15])), b=ri(rng,1,byDiff(diff,[6,9,9,12,20]))*dsign(rng,diff,1); var c=a*x+b;
   return { promptTeX:'\\text{Solve } '+cterm(a,'x')+sconst(b)+' = '+c, answer:String(x), accept:function(v){return acceptNumeric(v,x);},
     solutionTeX:(b<0?'Add $'+(-b)+'$':'Subtract $'+b+'$')+' from both sides: $'+cterm(a,'x')+' = '+(c-b)+'$. Divide by $'+a+'$: $x = '+x+'$.',
     hints:['Get the $x$ term by itself first.','Undo the constant, then undo the $\\times'+a+'$.'] };
 };
 GEN['two-step-equation'] = function(rng,diff){
   // a x + b = c x + d  -> x = (d-b)/(a-c)
-  var x=ri(rng,-6,8), a=ri(rng,3,9), c=ri(rng,1,a-1), b=ri(rng,1,8)*(rng()<0.5?-1:1); var d=(a-c)*x+b;
+  var x=ri(rng,byDiff(diff,[1,-3,-6,-9,-12]),byDiff(diff,[5,7,8,10,12])), a=ri(rng,3,byDiff(diff,[5,6,9,11,12])), c=ri(rng,1,a-1), b=ri(rng,1,byDiff(diff,[5,8,8,12,15]))*dsign(rng,diff,1); var d=(a-c)*x+b;
   return { promptTeX:'\\text{Solve } '+cterm(a,'x')+sconst(b)+' = '+cterm(c,'x')+sconst(d), answer:String(x), accept:function(v){return acceptNumeric(v,x);},
     solutionTeX:'Collect the $x$ terms on one side: $'+cterm(a-c,'x')+' = '+(d-b)+'$, so $x = '+x+'$.',
     hints:['Get all the $x$ terms on one side.','Subtract $'+cterm(c,'x')+'$ from both sides.'] };
 };
 GEN['evaluate-expr'] = function(rng,diff){
-  var a=ri(rng,2,6), b=ri(rng,1,6)*(rng()<0.5?-1:1), x=ri(rng,-5,6); var ans=a*x+b;  // b nonzero → no "= 12 = 12" doubled step
+  var a=ri(rng,2,byDiff(diff,[4,5,6,9,12])), b=ri(rng,1,byDiff(diff,[4,6,6,9,12]))*dsign(rng,diff,1), x=ri(rng,byDiff(diff,[1,-3,-5,-8,-10]),byDiff(diff,[5,6,6,9,12])); var ans=a*x+b;  // b nonzero → no "= 12 = 12" doubled step
   return { promptTeX:'\\text{Evaluate } '+cterm(a,'x')+sconst(b)+' \\text{ at } x='+x, answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
     solutionTeX:'Substitute $x='+x+'$: $'+a+'('+x+')'+sconst(b)+' = '+(a*x)+sconst(b)+' = '+ans+'$.',
     hints:['Replace every $x$ with '+x+'.','Mind the signs.'] };
 };
 GEN['expand-foil'] = function(rng,diff){
-  var a=ri(rng,1,7)*(rng()<0.5?-1:1), b=ri(rng,1,7)*(rng()<0.5?-1:1); var ansExpr='x^2+'+(a+b)+'*x+'+(a*b);
+  var a=ri(rng,1,byDiff(diff,[4,5,7,9,12]))*dsign(rng,diff,2), b=ri(rng,1,byDiff(diff,[4,5,7,9,12]))*dsign(rng,diff,2); var ansExpr='x^2+'+(a+b)+'*x+'+(a*b);
   var tex='x^2'+sterm(a+b,'x')+sconst(a*b);
   return { promptTeX:'\\text{Expand } (x'+sconst(a)+')(x'+sconst(b)+')', answer:tex,
     accept:function(v){return !/\(/.test(v) && acceptExpr(v, ansExpr);},  // must be EXPANDED (no parens), not the problem typed back
@@ -4889,24 +4982,25 @@ GEN['expand-foil'] = function(rng,diff){
     hints:['First, Outer, Inner, Last.','The middle term adds the two numbers; the last multiplies them.'] };
 };
 GEN['factor-trinomial'] = function(rng,diff){
-  var m=ri(rng,1,7)*(rng()<0.5?-1:1), n=ri(rng,1,7)*(rng()<0.5?-1:1); var b=m+n, c=m*n; var ansExpr='(x+'+m+')*(x+'+n+')';
+  var m=ri(rng,1,byDiff(diff,[4,5,7,9,11]))*dsign(rng,diff,2), n=ri(rng,1,byDiff(diff,[4,5,7,9,11]))*dsign(rng,diff,2); var b=m+n, c=m*n; var ansExpr='(x+'+m+')*(x+'+n+')';
   var tex='(x'+sconst(m)+')(x'+sconst(n)+')';
   return { promptTeX:'\\text{Factor } x^2'+sterm(b,'x')+sconst(c), answer:tex,
-    accept:function(v){return /\([^)]*x/.test(v) && acceptExpr(v, 'x^2+'+b+'*x+'+c);}, // must be FACTORED (a product of factors), not the trinomial typed back
+    accept:function(v){return !/x\s*\^?\s*2/.test(v) && /\([^)]*x/.test(v) && acceptExpr(v, 'x^2+'+b+'*x+'+c);}, // must be FACTORED — reject the unfactored trinomial (still has x^2) typed back
     solutionTeX:'Find two numbers that multiply to $'+c+'$ and add to $'+b+'$: $'+m+'$ and $'+n+'$. So $'+tex+'$.',
     hints:['What multiplies to '+c+' and adds to '+b+'?','Both signs come from those two numbers.'] };
 };
 GEN['diff-of-squares'] = function(rng,diff){
-  var a=ri(rng,2,12); var sq=a*a; var ansExpr='(x+'+a+')*(x-'+a+')';
+  var a=ri(rng,2,byDiff(diff,[5,7,9,12,16])); var sq=a*a; var ansExpr='(x+'+a+')*(x-'+a+')';
   return { promptTeX:'\\text{Factor } x^2 - '+sq, answer:'(x+'+a+')(x-'+a+')',
-    accept:function(v){return /\([^)]*x/.test(v) && acceptExpr(v, 'x^2-'+sq);},  // must be FACTORED
+    accept:function(v){return !/x\s*\^?\s*2/.test(v) && /\([^)]*x/.test(v) && acceptExpr(v, 'x^2-'+sq);},  // must be FACTORED — reject the unfactored x^2-… typed back
     solutionTeX:'Difference of squares: $x^2-'+sq+' = (x+'+a+')(x-'+a+')$ since $'+a+'^2='+sq+'$.',
     hints:['$a^2-b^2=(a+b)(a-b)$.','What squares to '+sq+'?'] };
 };
 GEN['solve-quadratic'] = function(rng,diff){
   // nonzero, DISTINCT roots → no "(x+0)", no "+0x", and no redundant "x=5, x=5"
-  var r1=ri(rng,1,6)*(rng()<0.5?-1:1), r2=ri(rng,1,6)*(rng()<0.5?-1:1);
-  var grd=0; while(r2===r1 && grd++<12) r2=ri(rng,1,6)*(rng()<0.5?-1:1);
+  var rmax=byDiff(diff,[4,5,6,9,11]);
+  var r1=ri(rng,1,rmax)*dsign(rng,diff,2), r2=ri(rng,1,rmax)*dsign(rng,diff,2);
+  var grd=0; while(r2===r1 && grd++<12) r2=ri(rng,1,rmax)*dsign(rng,diff,2);
   var b=-(r1+r2), c=r1*r2;
   return { promptTeX:'\\text{Solve } x^2'+sterm(b,'x')+sconst(c)+' = 0', answer:'x='+r1+',\\; x='+r2, plain:r1+','+r2,
     accept:function(v){return acceptSet(v,[r1,r2]);},
@@ -4914,25 +5008,31 @@ GEN['solve-quadratic'] = function(rng,diff){
     hints:['Try factoring first.','Two numbers multiplying to '+c+' and adding to '+b+'.'] };
 };
 GEN['linear-systems'] = function(rng,diff){
-  var x=ri(rng,-5,6), y=ri(rng,-5,6);
-  var a1=ri(rng,1,5), b1=ri(rng,1,5), c1=a1*x+b1*y;
-  var a2=ri(rng,1,5), b2=ri(rng,-5,-1), c2=a2*x+b2*y;
+  var sm=byDiff(diff,[3,4,5,7,9]), cm=byDiff(diff,[3,4,5,6,8]), lo=byDiff(diff,[1,-2,-5,-7,-9]);
+  var x=ri(rng,lo,sm), y=ri(rng,lo,sm); var gy=0; while(y===x && gy++<12) y=ri(rng,lo,sm);   // distinct x,y → unambiguous (x,y) vs (y,x)
+  var a1=ri(rng,1,cm), b1=ri(rng,1,cm), c1=a1*x+b1*y;
+  var a2=ri(rng,1,cm), b2=ri(rng,-cm,-1), c2=a2*x+b2*y;
   return { promptTeX:'\\begin{cases}'+cterm(a1,'x')+sterm(b1,'y')+' = '+c1+' \\\\ '+cterm(a2,'x')+sterm(b2,'y')+' = '+c2+'\\end{cases}', answer:'x='+x+',\\; y='+y, plain:'x='+x+', y='+y,
     accept:function(v){return acceptPair(v,x,y);},
     solutionTeX:'Solve by elimination or substitution: $x='+x+',\\; y='+y+'$. (Check: both equations hold.)',
     hints:['Eliminate one variable by combining the equations.','Then back-substitute.'] };
 };
 GEN['slope-two-points'] = function(rng,diff){
-  var x1=ri(rng,-6,6), x2=ri(rng,-6,6); while(x2===x1) x2=ri(rng,-6,6);
-  var y1=ri(rng,-6,6), y2=ri(rng,-6,6); var m=(y2-y1)/(x2-x1);
+  var R=byDiff(diff,[4,5,6,8,10]), x1,x2,y1,y2,m;
+  if(diff<=1){   // clean integer slope through small points (easy levels stay tidy)
+    var mm=ri(rng,1,byDiff(diff,[3,5]))*dsign(rng,diff,1); x1=ri(rng,-2,3); x2=x1+ri(rng,1,3); y1=ri(rng,-4,5); y2=y1+mm*(x2-x1); m=mm;
+  } else {
+    x1=ri(rng,-R,R); x2=ri(rng,-R,R); while(x2===x1) x2=ri(rng,-R,R);
+    y1=ri(rng,-R,R); y2=ri(rng,-R,R); m=(y2-y1)/(x2-x1);
+  }
   return { promptTeX:'\\text{Slope through }('+x1+','+y1+')\\text{ and }('+x2+','+y2+')?', answer:fmtNum(m),
     accept:function(v){return acceptNumeric(v,m);},
     solutionTeX:'$m = \\frac{'+y2+'-('+y1+')}{'+x2+'-('+x1+')} = \\frac{'+(y2-y1)+'}{'+(x2-x1)+'} = '+fmtNum(m)+'$.',
     hints:['Slope is rise over run.','$(y_2-y_1)/(x_2-x_1)$.'] };
 };
 GEN['pythagoras-find'] = function(rng,diff){
-  var triples=[[3,4,5],[5,12,13],[8,15,17],[6,8,10],[7,24,25],[9,12,15],[20,21,29]];
-  var t=pick(rng,triples);
+  var triples=[[3,4,5],[6,8,10],[5,12,13],[8,15,17],[9,12,15],[7,24,25],[20,21,29],[9,40,41],[12,35,37]];
+  var t=pick(rng, triples.slice(0, byDiff(diff,[2,3,5,7,9])));   // bigger triples only unlock at higher levels
   if(rng()<0.6){ // find hypotenuse
     return { promptTeX:'\\text{Right triangle, legs }'+t[0]+'\\text{ and }'+t[1]+'.\\text{ Hypotenuse?}', answer:String(t[2]),
       accept:function(v){return acceptNumeric(v,t[2]);},
@@ -4946,15 +5046,15 @@ GEN['pythagoras-find'] = function(rng,diff){
 };
 GEN['area-basic'] = function(rng,diff){
   var mode=ri(rng,0,1);
-  if(mode===0){ var w=ri(rng,2,15), h=ri(rng,2,15); var ans=w*h;
+  if(mode===0){ var dm=byDiff(diff,[6,9,15,25,40]); var w=ri(rng,2,dm), h=ri(rng,2,dm); var ans=w*h;
     return { promptTeX:'\\text{Area of a }'+w+'\\times'+h+'\\text{ rectangle?}', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
       solutionTeX:'Area $= w\\times h = '+w+'\\times'+h+' = '+ans+'$.', hints:['Length times width.','Count the unit squares.'] }; }
-  var b=ri(rng,2,16), hh=ri(rng,2,16); var bh=b*hh; var ans2=bh/2;
+  var dm2=byDiff(diff,[6,10,16,26,40]); var b=ri(rng,2,dm2), hh=ri(rng,2,dm2); var bh=b*hh; var ans2=bh/2;
   return { promptTeX:'\\text{Area of a triangle, base }'+b+'\\text{, height }'+hh+'?', answer:fmtNum(ans2), accept:function(v){return acceptNumeric(v,ans2);},
     solutionTeX:'Area $= \\tfrac12 b h = \\tfrac12\\times'+b+'\\times'+hh+' = '+fmtNum(ans2)+'$.', hints:['Half of base times height.','A triangle is half its bounding rectangle.'] };
 };
 GEN['power-rule'] = function(rng,diff){
-  var n=ri(rng,2,diff>=2?6:4), a=ri(rng,2,7); var ce=a*n, ne=n-1;
+  var n=ri(rng,2,byDiff(diff,[3,4,5,6,8])), a=ri(rng,2,byDiff(diff,[5,7,9,11,12])); var ce=a*n, ne=n-1;
   var ansExpr = ce+'*x^'+ne;
   var ansTeX = ce + (ne===1 ? 'x' : 'x^{'+ne+'}');   // 14x, not 14x^{1}
   return { promptTeX:'\\frac{d}{dx}\\left('+a+'x^{'+n+'}\\right) = \\;?', answer:ansTeX, plain:ansExpr,
@@ -4963,16 +5063,16 @@ GEN['power-rule'] = function(rng,diff){
     hints:['Multiply by the exponent, then lower it by 1.','$\\frac{d}{dx}x^n = n x^{n-1}$.'] };
 };
 GEN['simple-limit'] = function(rng,diff){
-  var mode=ri(rng,0,1);
-  if(mode===0){ var a=ri(rng,2,6), b=ri(rng,-5,5), pt=ri(rng,-3,4); var ans=a*pt+b;
+  var mode = diff<=1 ? 0 : ri(rng,0,1);   // the factor-and-cancel mode is harder; hold it back at easy levels
+  if(mode===0){ var a=ri(rng,2,byDiff(diff,[4,5,6,8,10])), b=ri(rng,byDiff(diff,[0,-3,-5,-8,-10]),byDiff(diff,[3,5,5,8,10])), pt=ri(rng,byDiff(diff,[0,-2,-3,-4,-5]),byDiff(diff,[3,4,4,6,7])); var ans=a*pt+b;
     return { promptTeX:'\\lim_{x\\to '+pt+'}\\,('+cterm(a,'x')+sconst(b)+') = \\;?', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
       solutionTeX:'The function is continuous, so just substitute $x='+pt+'$: $'+a+'('+pt+')'+sconst(b)+'='+ans+'$.', hints:['For a polynomial, plug the value straight in.','Continuity means the limit equals the value.'] }; }
-  var r=ri(rng,2,6); var ans2=2*r; // lim x->r (x^2-r^2)/(x-r) = x+r -> 2r
+  var r=ri(rng,2,byDiff(diff,[4,5,6,8,10])); var ans2=2*r; // lim x->r (x^2-r^2)/(x-r) = x+r -> 2r
   return { promptTeX:'\\lim_{x\\to '+r+'}\\,\\frac{x^2-'+(r*r)+'}{x-'+r+'} = \\;?', answer:String(ans2), accept:function(v){return acceptNumeric(v,ans2);},
     solutionTeX:'Factor: $\\frac{(x-'+r+')(x+'+r+')}{x-'+r+'} = x+'+r+'$. Then $x\\to '+r+'$ gives $'+ans2+'$.', hints:['Factor the top — the bad factor cancels.','$x^2-a^2=(x-a)(x+a)$.'] };
 };
 GEN['basic-integral'] = function(rng,diff){
-  var n=ri(rng,1,diff>=2?5:3), a=ri(rng,2,6); var ne=n+1; var coef=a/ne;
+  var n=ri(rng,1,byDiff(diff,[2,3,4,5,6])), a=ri(rng,2,byDiff(diff,[4,6,6,8,9])); var ne=n+1; var coef=a/ne;
   var ansExpr = '('+a+'/'+ne+')*x^'+ne;
   var cf=fracTeX(a,ne); var disp=(cf==='1'?'':cf)+'x^{'+ne+'}+C';   // drop a leading coefficient of 1
   return { promptTeX:'\\int '+a+'x^{'+n+'}\\,dx = \\;?', answer:disp, plain:ansExpr+'+C',
@@ -4982,12 +5082,85 @@ GEN['basic-integral'] = function(rng,diff){
     hints:['Add 1 to the exponent, then divide by the new exponent.','Conventionally written with $+C$.'] };
 };
 GEN['rounding-estimate'] = function(rng,diff){
-  var a=ri(rng,120,899), b=ri(rng,120,899);
+  var hi=byDiff(diff,[399,899,2999,8999,20999]); var a=ri(rng,120,hi), b=ri(rng,120,hi);
   var ra=Math.round(a/100)*100, rb=Math.round(b/100)*100; var ans=ra+rb;
   return { promptTeX:'\\text{Estimate }'+a+' + '+b+'\\text{ (round each to the nearest 100).}', answer:String(ans),
     accept:function(v){return acceptNumeric(v,ans);},
     solutionTeX:'$'+a+'\\approx'+ra+'$, $'+b+'\\approx'+rb+'$, so $'+a+'+'+b+'\\approx'+ans+'$ (exact: $'+(a+b)+'$).',
     hints:['Round each number first.','Nearest hundred, then add.'] };
+};
+// ---- additional topics ---------------------------------------------------
+GEN['powers-eval'] = function(rng,diff){
+  var b=ri(rng,2,byDiff(diff,[3,4,5,7,10])), e=ri(rng,2,byDiff(diff,[2,3,3,4,4])); var ans=Math.pow(b,e);
+  return { promptTeX:b+'^{'+e+'} = \\;?', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
+    solutionTeX:'$'+b+'^{'+e+'} = '+ans+'$ — multiply '+b+' by itself '+e+' times.',
+    hints:['An exponent means repeated multiplication.','$'+b+'^{'+e+'}$ is '+e+' copies of '+b+' multiplied.'] };
+};
+GEN['gcf'] = function(rng,diff){
+  var g=ri(rng,2,byDiff(diff,[4,6,8,10,12])), p=ri(rng,2,byDiff(diff,[5,7,9,12,15])), q=ri(rng,2,byDiff(diff,[5,7,9,12,15]));
+  var a=g*p, b=g*q; var ans=gcd(a,b);
+  return { promptTeX:'\\gcd('+a+', '+b+') = \\;?', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
+    solutionTeX:'The greatest common factor of $'+a+'$ and $'+b+'$ is $'+ans+'$.',
+    hints:['Find the biggest number that divides both.','List shared prime factors and multiply them.'] };
+};
+GEN['lcm'] = function(rng,diff){
+  var a=ri(rng,2,byDiff(diff,[6,9,12,15,20])), b=ri(rng,2,byDiff(diff,[6,9,12,15,20])); var ans=a*b/gcd(a,b);
+  return { promptTeX:'\\text{lcm}('+a+', '+b+') = \\;?', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
+    solutionTeX:'$\\text{lcm}('+a+','+b+') = \\frac{'+a+'\\times'+b+'}{\\gcd('+a+','+b+')} = \\frac{'+(a*b)+'}{'+gcd(a,b)+'} = '+ans+'$.',
+    hints:['The smallest number both divide into evenly.','lcm $=$ product $\\div$ gcd.'] };
+};
+GEN['abs-value'] = function(rng,diff){
+  var m=byDiff(diff,[6,9,12,20,40]); var a=ri(rng,-m,m), b=ri(rng,-m,m); var ans=Math.abs(a-b);
+  return { promptTeX:'|'+a+' - ('+b+')| = \\;?', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
+    solutionTeX:'$'+a+' - ('+b+') = '+(a-b)+'$, and $|'+(a-b)+'| = '+ans+'$.',
+    hints:['Work out what is inside the bars first.','Absolute value is never negative.'] };
+};
+GEN['ratio-proportion'] = function(rng,diff){
+  var a=ri(rng,1,byDiff(diff,[4,5,6,9,12])), b=ri(rng,2,byDiff(diff,[5,6,8,10,12])), k=ri(rng,2,byDiff(diff,[3,4,5,7,9])); var d=b*k, x=a*k;
+  return { promptTeX:'\\text{Solve } \\frac{'+a+'}{'+b+'} = \\frac{x}{'+d+'}', answer:String(x), accept:function(v){return acceptNumeric(v,x);},
+    solutionTeX:'$'+b+'$ scales to $'+d+'$ by $\\times'+k+'$, so $x = '+a+'\\times'+k+' = '+x+'$.',
+    hints:['What do you multiply '+b+' by to get '+d+'?','Scale the top by the same factor.'] };
+};
+GEN['percent-discount'] = function(rng,diff){
+  var price=ri(rng,2,byDiff(diff,[10,20,40,80,150]))*5; var pct=pick(rng, [10,20,25,50,5,15,40].slice(0,byDiff(diff,[2,3,4,6,7])));
+  var ans=price*(1-pct/100);
+  return { promptTeX:'\\text{A }'+price+'\\text{-dollar item is }'+pct+'\\%\\text{ off. New price?}', answer:fmtNum(ans), accept:function(v){return acceptNumeric(v,ans);},
+    solutionTeX:'Pay $'+(100-pct)+'\\%$: $'+price+'\\times'+((100-pct)/100)+' = '+fmtNum(ans)+'$.',
+    hints:['Take off the discount — or pay $(100-'+pct+')\\%$.','$'+price+'\\times'+((100-pct)/100)+'$'] };
+};
+GEN['distribute'] = function(rng,diff){
+  var a=ri(rng,2,byDiff(diff,[4,5,7,9,12])), b=ri(rng,1,byDiff(diff,[5,7,9,12,15]))*dsign(rng,diff,2); var ansExpr=a+'*x+'+(a*b);
+  return { promptTeX:'\\text{Expand } '+a+'(x'+sconst(b)+')', answer:cterm(a,'x')+sconst(a*b),
+    accept:function(v){return !/\(/.test(v) && acceptExpr(v, ansExpr);},   // must be expanded, not the problem typed back
+    solutionTeX:'Distribute: $'+a+'\\cdot x + '+a+'\\cdot('+b+') = '+cterm(a,'x')+sconst(a*b)+'$.',
+    hints:['Multiply '+a+' by each term inside the parentheses.','$'+a+'\\cdot x$ and $'+a+'\\cdot'+b+'$.'] };
+};
+GEN['arithmetic-sequence'] = function(rng,diff){
+  var a1=ri(rng,byDiff(diff,[1,1,-3,-6,-9]),byDiff(diff,[6,9,12,15,20])), d=ri(rng,2,byDiff(diff,[4,5,7,9,12]))*dsign(rng,diff,3), n=ri(rng,4,byDiff(diff,[6,8,10,15,25])); var ans=a1+(n-1)*d;
+  return { promptTeX:'\\text{A sequence starts at }'+a1+'\\text{ and goes up by }'+d+'\\text{ each step. The }'+n+'\\text{th term?}', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
+    solutionTeX:'$a_{'+n+'} = '+a1+' + ('+n+'-1)\\times'+d+' = '+a1+' + '+((n-1)*d)+' = '+ans+'$.',
+    hints:['Each term adds '+d+' to the one before.','$a_n = a_1 + (n-1)d$.'] };
+};
+GEN['circle-area'] = function(rng,diff){
+  var r=ri(rng,2,byDiff(diff,[5,7,10,15,20])); var k=r*r; var ans=k*Math.PI;
+  return { promptTeX:'\\text{Area of a circle with radius }'+r+'?\\text{ (leave in terms of }\\pi)', answer:k+'\\pi', plain:k+'pi', accept:function(v){return acceptNumeric(v,ans);},
+    solutionTeX:'$A = \\pi r^2 = \\pi\\times'+r+'^2 = '+k+'\\pi$.',
+    hints:['$A = \\pi r^2$.','Square the radius, then multiply by $\\pi$.'] };
+};
+GEN['mean-average'] = function(rng,diff){
+  var n=byDiff(diff,[3,3,4,4,5]), M=ri(rng,byDiff(diff,[5,8,12,20,30]),byDiff(diff,[15,25,40,70,99])), spread=byDiff(diff,[2,3,5,8,12]);
+  var nums=[],i; for(i=0;i<n;i++) nums.push(M);
+  for(i=0;i+1<n;i+=2){ var kk=ri(rng,1,Math.max(1,Math.min(spread,M-1))); nums[i]+=kk; nums[i+1]-=kk; }
+  return { promptTeX:'\\text{Mean of } '+nums.join(',\\,')+'?', answer:String(M), accept:function(v){return acceptNumeric(v,M);},
+    solutionTeX:'Sum $= '+nums.join('+')+' = '+(M*n)+'$; divide by '+n+': $'+M+'$.',
+    hints:['Add every number together.','Then divide by how many there are ('+n+').'] };
+};
+GEN['median'] = function(rng,diff){
+  var n=byDiff(diff,[3,3,5,5,7]), hi=byDiff(diff,[15,25,40,70,99]); var nums=[],i; for(i=0;i<n;i++) nums.push(ri(rng,1,hi));
+  var sorted=nums.slice().sort(function(a,b){return a-b;}); var ans=sorted[(n-1)/2];
+  return { promptTeX:'\\text{Median of } '+nums.join(',\\,')+'?', answer:String(ans), accept:function(v){return acceptNumeric(v,ans);},
+    solutionTeX:'In order: $'+sorted.join(',\\,')+'$. The middle value is $'+ans+'$.',
+    hints:['Sort the numbers first.','The median is the middle value.'] };
 };
 
 // ================================================================
@@ -5023,7 +5196,18 @@ var GEN_META = [
   ['power-rule','Power rule (derivatives)','Calculus','Advanced'],
   ['simple-limit','Evaluate limits','Calculus','Advanced'],
   ['basic-integral','Power-rule integration','Calculus','Advanced'],
-  ['rounding-estimate','Estimation & rounding','Estimation','Beginner']
+  ['rounding-estimate','Estimation & rounding','Estimation','Beginner'],
+  ['powers-eval','Exponents','Arithmetic','Intermediate'],
+  ['gcf','Greatest common factor','Arithmetic','Beginner'],
+  ['lcm','Least common multiple','Arithmetic','Intermediate'],
+  ['abs-value','Absolute value','Arithmetic','Beginner'],
+  ['ratio-proportion','Proportions','Fractions','Intermediate'],
+  ['percent-discount','Discounts & sale prices','Fractions','Intermediate'],
+  ['distribute','Distributing','Algebra','Beginner'],
+  ['arithmetic-sequence','Arithmetic sequences','Algebra','Intermediate'],
+  ['circle-area','Area of a circle','Geometry & Trig','Intermediate'],
+  ['mean-average','Mean (average)','Statistics','Beginner'],
+  ['median','Median','Statistics','Intermediate']
 ];
 var SKILLS = [];
 GEN_META.forEach(function(m){ SKILLS.push({ id:m[0], name:m[1], topic:m[2], level:m[3], kind:'gen', gen:GEN[m[0]] }); });
@@ -5034,17 +5218,17 @@ var SKILL_BY_ID = {}; SKILLS.forEach(function(s){ SKILL_BY_ID[s.id]=s; });
 // learning TRACKS — a focus area = a subset of topics the adaptive engine draws from.
 var TRACKS = {
   all:          { id:'all',          name:'Everything',     icon:'🌐', desc:'All topics, fully adaptive',           topics:['Arithmetic','Fractions','Mental Math','Algebra','Geometry & Trig','Calculus','Estimation','Reasoning','Probability','Logic & Proof','Problem Solving'] },
-  foundations:  { id:'foundations',  name:'Foundations',    icon:'🔢', desc:'Arithmetic, fractions, percents',       topics:['Arithmetic','Fractions','Mental Math','Estimation'] },
+  foundations:  { id:'foundations',  name:'Foundations',    icon:'🔢', desc:'Arithmetic, fractions, percents',       topics:['Arithmetic','Fractions','Mental Math','Estimation','Statistics'] },
   algebra:      { id:'algebra',      name:'Algebra',        icon:'📐', desc:'Equations, factoring, systems',         topics:['Algebra'] },
   geometry:     { id:'geometry',     name:'Geometry & Trig',icon:'📏', desc:'Shapes, Pythagoras, the unit circle',   topics:['Geometry & Trig'] },
   calculus:     { id:'calculus',     name:'Calculus',       icon:'∫',  desc:'Limits, derivatives, integrals',        topics:['Calculus'] },
-  reasoning:    { id:'reasoning',    name:'Reasoning',      icon:'🧠', desc:'Logic, probability, problem-solving',   topics:['Reasoning','Probability','Logic & Proof','Problem Solving'] }
+  reasoning:    { id:'reasoning',    name:'Reasoning',      icon:'🧠', desc:'Logic, probability, statistics',        topics:['Reasoning','Probability','Logic & Proof','Problem Solving','Statistics'] }
 };
 function currentTrack(){ return TRACKS[state.track] || TRACKS.all; }
 
 // problem-of-the-day pool: generator skills only (need a fresh item each day)
 var POTD_POOL = GEN_META.map(function(m){return m[0];}).filter(function(id){
-  return ['add-multi','times-tables','order-of-operations','negatives','simplify-fraction','percent-of','percent-change','solve-linear','expand-foil','factor-trinomial','solve-quadratic','slope-two-points','pythagoras-find','power-rule','simple-limit','square-5','mult-by-11','area-basic'].indexOf(id)>=0;
+  return ['add-multi','times-tables','order-of-operations','negatives','simplify-fraction','percent-of','percent-change','solve-linear','expand-foil','factor-trinomial','solve-quadratic','slope-two-points','pythagoras-find','power-rule','simple-limit','square-5','mult-by-11','area-basic','powers-eval','gcf','ratio-proportion','distribute','circle-area','mean-average','percent-discount','abs-value','arithmetic-sequence'].indexOf(id)>=0;
 });
 
 // ================================================================
@@ -5180,7 +5364,7 @@ function recordAnswer(id, correct, itemTier){
 function dueSkills(){
   var t=now(), out=[];
   for(var id in state.skillStats){ var st=state.skillStats[id]; if(!st.attempts || !SKILL_BY_ID[id]) continue;
-    if((st.dueDate && st.dueDate<=t) || recall(st)<0.9) out.push(id); }
+    if(st.dueDate && st.dueDate<=t) out.push(id); }   // the FSRS dueDate already encodes target retention — don't re-flag everything every few minutes
   out.sort(function(a,b){ return recall(state.skillStats[a]) - recall(state.skillStats[b]); });  // most-at-risk first
   return out;
 }
@@ -5236,8 +5420,9 @@ function weakestSkill(){
 // ----- adaptive session composer: due reviews + weaknesses + interleaving -----
 function trackSkillIds(){
   var t=TRACKS[state.track]; var all=SKILLS.map(function(s){return s.id;});
-  if(!t || !t.skills || t.id==='all') return all;
-  return all.filter(function(id){ var s=SKILL_BY_ID[id]; return t.topics.indexOf(s.topic)>=0; });
+  if(!t || t.id==='all') return all;
+  var ids=all.filter(function(id){ var s=SKILL_BY_ID[id]; return s && t.topics.indexOf(s.topic)>=0; });
+  return ids.length ? ids : all;   // never strand the user with an empty pool
 }
 function composeAdaptiveSession(n){
   n = n || clamp(state.dailyGoal||10, 6, 16);
@@ -5276,8 +5461,7 @@ function startPlacement(){
   pool.forEach(function(id){ if(picks.indexOf(id)<0 && picks.length<8) picks.push(id); });
   picks=picks.slice(0,8);
   if(!picks.length){ startSmart(); return; }
-  startSession(picks, 'Placement', picks.length, 'placement');
-  session.placeTier=2;
+  startSession(picks, 'Placement', picks.length, 'placement');   // placeTier is initialized inside startSession (before the first item)
 }
 
 // ---- achievements (checked from existing state after relevant actions) ----
@@ -5423,8 +5607,15 @@ function markActiveToday(){
   if(s.lastActiveDate){
     var d=dayDiff(t, s.lastActiveDate);
     if(d>3) state._comeback=true;   // returned after a multi-day break
-    if(d===1) s.current = s.current+1;
-    else if(d>1) s.current = 1;
+    if(d===1){ s.current = s.current+1; }
+    else if(d>1){
+      // skipped (d-1) day(s): spend freezes to bridge the gap ONLY now that the
+      // user is actually practicing — so passive app-opens never burn the net.
+      var missed=d-1;
+      if((s.current||0)>0 && (state.streakFreezes||0)>=missed){
+        state.streakFreezes-=missed; s.current=s.current+1; state._freezeJustUsed=s.current;
+      } else { s.current = 1; }   // gap too big for the freezes on hand → restart
+    }
     else s.current = s.current||1;
   } else { s.current = 1; }
   s.lastActiveDate = t;
@@ -5435,13 +5626,12 @@ function checkStreakBroken(){
   var s=state.streak;
   if(s.lastActiveDate){
     var d=dayDiff(todayStr(), s.lastActiveDate);
-    if(d===2 && (state.streakFreezes||0)>0 && (s.current||0)>0){
-      // missed exactly one day — spend a freeze and bridge the gap so the
-      // chain survives once the user practices today.
-      state.streakFreezes--; state._freezeJustUsed = s.current;
-      var y=new Date(); y.setDate(y.getDate()-1); s.lastActiveDate=todayStr(y);
-      saveState();
-    } else if(d>1){ s.current=0; }
+    var missed=d-1;   // whole days skipped before today (d===1 → 0, still fine)
+    // A passive launch never spends a freeze. The streak only truly BREAKS once the
+    // gap is bigger than your freezes could bridge; otherwise it's still recoverable
+    // by practicing today (which is when markActiveToday actually spends the freeze).
+    // (No saveState here — that would re-stamp updatedAt and undo stampLegacyProgress.)
+    if(d>1 && missed > (state.streakFreezes||0)) s.current=0;
   }
   refreshStreakUI();
 }
@@ -5682,7 +5872,7 @@ function renderToday(){
 
   // streak safety net: celebrate a freeze save, or nudge an at-risk streak
   if(state._freezeJustUsed){
-    h+= '<div class="card p-3 mb-3" style="border-color:rgba(96,165,250,0.4);background:rgba(96,165,250,0.08)"><div style="font-size:13.5px;color:#dbeafe">❄️ <strong>Streak saved.</strong> A freeze covered your missed day — you’re still on a '+state._freezeJustUsed+'-day streak. Do a problem today to keep it going.</div></div>';
+    h+= '<div class="card p-3 mb-3" style="border-color:rgba(96,165,250,0.4);background:rgba(96,165,250,0.08)"><div style="font-size:13.5px;color:#dbeafe">❄️ <strong>Streak saved!</strong> A freeze covered your missed day — you’re on a '+state._freezeJustUsed+'-day streak. 🔥</div></div>';
     state._freezeJustUsed=null; saveState();
   } else if(solvedToday===0 && (state.streak.current||0)>=3){
     h+= '<button class="card p-3 mb-3 w-full text-left" data-act="startWarmup" style="border-color:rgba(var(--accent-rgb),0.35)"><div style="font-size:13.5px"><span style="color:var(--accent);font-weight:700">🔥 Keep your '+(state.streak.current)+'-day streak alive</span> — just one problem today.'+((state.streakFreezes||0)>0?' <span class="micro" style="text-transform:none;letter-spacing:0">'+state.streakFreezes+' freeze in reserve.</span>':'')+'</div></button>';
@@ -5777,7 +5967,8 @@ function getDailyProblem(){
   var skillId = POTD_POOL[seed % POTD_POOL.length];
   var skill = SKILL_BY_ID[skillId];
   var rng = mulberry32(seed);
-  var prob = skill.gen(rng, 1);
+  var st = statFor(skillId);
+  var prob = skill.gen(rng, clamp((st.tier||2)-1, 0, 4));   // daily problem matches your level on that skill
   return { skill:skill, prob:prob };
 }
 var _potd=null;
@@ -6035,7 +6226,7 @@ function buildItemFromSkill(skill, opts){
   if(skill.kind==='gen'){
     var st=statFor(skill.id);
     var tier=(opts.forceTier!=null)?clamp(opts.forceTier,1,5):pickTier(st, opts.review);  // 1-5, adaptive (85%-rule); forced during placement
-    var diff=clamp(tier-2,0,3);                   // map tier→generator difficulty (tier5 now unlocks hardest)
+    var diff=clamp(tier-1,0,4);                   // 1:1 tier→difficulty (tier1=easiest … tier5=hardest)
     var rng=mulberry32((hashStr(skill.id)+ (now()&0xffff) + Math.floor(Math.random()*1e6))>>>0);
     var p=skill.gen(rng,diff);
     return { skillId:skill.id, type:'input', tier:tier, promptTeX:p.promptTeX, answer:p.answer, accept:p.accept, solutionTeX:p.solutionTeX, hints:p.hints||[] };
@@ -6048,6 +6239,7 @@ function startSession(skillIds, label, limit, kind){
   var ids = skillIds.filter(function(id){return SKILL_BY_ID[id];});
   if(!ids.length){ toast('Nothing to practice yet'); return; }
   session={ ids:ids, label:label||'Practice', idx:0, score:0, total:0, moved:{}, hintsShown:0, answered:false, item:null, limit:limit||0, xp:0, run:0, bestRun:0, tries:0, prevId:null, kind:kind||'practice' };
+  if(session.kind==='placement') session.placeTier=2;   // set BEFORE nextItem so the first question starts at the calibration tier, not tier 1
   nextItem();
   renderSessionSheet();
 }
@@ -6079,7 +6271,7 @@ function nextItem(){
   }
   session.prevId=id;
   session.item = buildItemFromSkill(SKILL_BY_ID[id], { review: session.kind==='review', forceTier: session.kind==='placement'?session.placeTier:null });
-  session.answered=false; session.hintsShown=0; session.tries=0;
+  session.answered=false; session.hintsShown=0; session.tries=0; session._chosen=null;   // clear last problem's choice so it can't paint a stale "wrong"
 }
 // short, discoverable note about what the parser accepts for this skill
 var FORMAT_HINT = {
@@ -6088,7 +6280,8 @@ var FORMAT_HINT = {
   'multiply-fractions':'A fraction in lowest terms, e.g. 5/6', 'expand-foil':'A polynomial, e.g. x^2+5x+6',
   'factor-trinomial':'Factored form, e.g. (x+2)(x+3)', 'diff-of-squares':'Factored form, e.g. (x+3)(x-3)',
   'power-rule':'Use ^ for powers, e.g. 12x^2', 'basic-integral':'Include +C, e.g. (3/2)x^2 + C',
-  'slope-two-points':'A number or fraction, e.g. -1/2'
+  'slope-two-points':'A number or fraction, e.g. -1/2',
+  'distribute':'A polynomial, e.g. 3x+6', 'circle-area':'A multiple of π, e.g. 25pi (or a decimal)'
 };
 function formatHintFor(it){
   if(it.type!=='input') return '';
@@ -6096,13 +6289,13 @@ function formatHintFor(it){
 }
 // skills whose answers need letters/operators get a full keyboard; pure-numeric
 // skills get the mobile numeric keypad.
-var NEEDS_TEXT = {'expand-foil':1,'factor-trinomial':1,'diff-of-squares':1,'solve-quadratic':1,'linear-systems':1,'power-rule':1,'basic-integral':1,'simplify-fraction':1,'add-fractions':1,'multiply-fractions':1,'fdp-convert':1,'slope-two-points':1};
+var NEEDS_TEXT = {'expand-foil':1,'factor-trinomial':1,'diff-of-squares':1,'solve-quadratic':1,'linear-systems':1,'power-rule':1,'basic-integral':1,'simplify-fraction':1,'add-fractions':1,'multiply-fractions':1,'fdp-convert':1,'slope-two-points':1,'distribute':1,'circle-area':1};
 function inputModeFor(it){ return (it && it.type==='input' && !NEEDS_TEXT[it.skillId]) ? 'decimal' : 'text'; }
 // a small symbol keypad for awkward-to-type characters on mobile (per skill type)
 function keypadFor(it){
   if(!it || it.type!=='input') return '';
   var id=it.skillId, keys=null;
-  if(/expand-foil|factor-trinomial|diff-of-squares|power-rule|basic-integral/.test(id)) keys=['x','^','(',')','+','-'];
+  if(/expand-foil|factor-trinomial|diff-of-squares|power-rule|basic-integral|distribute/.test(id)) keys=['x','^','(',')','+','-'];
   else if(/solve-quadratic|linear-systems/.test(id)) keys=['x','y','=',',','-','/'];
   else if(/fraction|fdp-convert|percent|slope-two-points|simplify/.test(id)) keys=['/','-','.'];
   if(!keys) return '';
@@ -6146,6 +6339,10 @@ function renderSessionSheet(){
     body+='<button class="btn-accent w-full rounded-xl py-3.5 text-sm font-bold" data-act="checkAnswer">Check answer</button>';
   }
   if(it.hints && it.hints.length){ body+='<button class="btn-ghost w-full rounded-xl py-2.5 text-sm mt-2" data-act="showHint">Show a hint</button>'; }
+  // upfront escape hatch: bail on the problem and reveal the worked answer. Counts as
+  // not-correct (same as the post-miss "Show solution"); the shared id="reveal-btn"
+  // means checkAnswer() won't add a second one after a wrong attempt.
+  body+='<button id="reveal-btn" class="btn-ghost w-full rounded-xl py-2.5 text-sm mt-2" style="color:var(--muted,#9a9a9a)" data-act="revealSolution">Give up &amp; show answer</button>';
   body+='</div></div>';
   openSheet(head+body,{full:true});
   var inp=el('ans'); if(inp){ if(!isTouch()) inp.focus(); inp.addEventListener('keydown',function(e){ if(e.key==='Enter') checkAnswer(); }); }
@@ -6264,7 +6461,8 @@ function endSession(){
   var wasChallenge = session.kind==='challenge';
   // placement quiz → estimate a starting level, seed the track, custom result
   if(session.kind==='placement' && total>0){
-    var lvl=clamp(Math.round((session.placeTier||2) + (acc>=80?1:acc<40?-1:0)),1,5);
+    var lvl=clamp(Math.round(session.placeTier||2),1,5);   // staircase already reflects every answer; no extra accuracy nudge (avoids double-counting the last answer)
+    (session.ids||[]).forEach(function(id){ var st=statFor(id); st.theta=clamp((lvl-3)*0.9,-2,2); st.tier=lvl; });   // calibrate the tested skills to the placed level (seedLevel only seeds untested ones)
     seedLevel(lvl); state.hasOnboarded=true; checkAchievements(); saveState();
     closeSheet(); confetti(140);
     var lname=['Building basics','Getting started','On your way','Strong','Advanced'][lvl-1];
@@ -6692,6 +6890,8 @@ function closeSheet(keepFocus){
   if(_sheetWrap){ _sheetWrap.remove(); _sheetWrap=null; }
   refreshBgInert();
   if(!keepFocus && _lastFocus){ try{ _lastFocus.focus({preventScroll:true}); }catch(e){} _lastFocus=null; }
+  // re-render the visible tab so settings changes (daily goal, name, focus track) apply immediately on close
+  if(!session){ try{ if(RENDERERS[state.tab]) RENDERERS[state.tab](); }catch(e){} }
 }
 function topmostDialog(){ var o=el('overlays'); if(!o) return null; var ds=o.querySelectorAll('[role="dialog"]'); return ds.length?ds[ds.length-1]:null; }
 var _toastQ=[], _toastBusy=false;
@@ -6769,6 +6969,7 @@ function openSettings(){
 }
 // (re)bind Enter-to-submit on the sync inputs — called from openSettings AND
 // refreshSyncPanel, since the latter replaces the panel's innerHTML on auth changes
+function syncSignOut(){ confirmModal('Sign out of sync?','Your progress is saved in the cloud and on your other devices — signing out just clears it from this device.',{ok:'Sign out'}).then(function(ok){ if(ok) SYNC.signOut(); }); }
 function wireSyncInputs(){
   function onEnter(id){ var n=el(id); if(n){ n.addEventListener('keydown', function(e){ if(e.key==='Enter'){ e.preventDefault(); syncSignIn(); } }); } }
   onEnter('sync-email'); onEnter('sync-pass');
@@ -6858,9 +7059,16 @@ function openOnboarding(){
         + '<div style="color:var(--text-mid,#9a9a9a);text-align:center;font-size:14px;margin-top:6px">Let’s find your starting point.</div>'
         + '<div class="micro" style="margin:22px 0 8px">YOUR NAME (OPTIONAL)</div>'
         + '<input id="ob-name" class="search-input" aria-label="Your name" placeholder="What should we call you?" value="'+escapeHtml(step.name||'')+'" />'
-        + '<div class="micro" style="margin:18px 0 10px">WHERE ARE YOU?</div>'
-        + [['Just starting','Beginner',1],['Brushing up','Beginner',2],['Comfortable','Intermediate',3],['Advanced','Advanced',5]].map(function(o,i){
-            return '<button class="choice mb-2" data-ob-level="'+o[1]+'" data-ln="'+o[2]+'" data-i="'+i+'">'+o[0]+'</button>'; }).join('')
+        + '<div class="micro" style="margin:18px 0 6px">WHERE ARE YOU WITH MATH?</div>'
+        + '<div style="color:var(--text-low,#8a8a8a);font-size:11.5px;margin:0 0 10px">Pick the closest — it sets your starting difficulty. You can recalibrate anytime.</div>'
+        + [['New to this','Beginner',1,'Building number sense: addition, times tables, simple fractions'],
+           ['A bit rusty','Beginner',2,'Arithmetic and basic fractions — but it has been a while'],
+           ['Comfortable','Intermediate',3,'Fractions, percents, and solving equations like 2x + 5 = 11'],
+           ['Confident','Advanced',4,'Factoring, quadratics, systems of equations, slope'],
+           ['Advanced','Advanced',5,'Calculus: derivatives, limits, and integrals']].map(function(o){
+            return '<button class="card-2 p-3 text-left mb-2 w-full" data-ob-level="'+o[1]+'" data-ln="'+o[2]+'">'
+              + '<div style="font-size:14px;font-weight:700">'+escapeHtml(o[0])+'</div>'
+              + '<div class="micro" style="font-size:10px;margin-top:2px;text-transform:none;letter-spacing:0;color:var(--text-mid,#9a9a9a)">'+escapeHtml(o[3])+'</div></button>'; }).join('')
         + '<button class="w-full text-sm mt-2" style="color:var(--text-low,#a6a6a6)" data-ob-skip>Skip for now</button></div>';
     } else {
       html='<div class="p-6"><div style="font-size:20px;font-weight:800">Choose a focus</div>'
@@ -6914,9 +7122,10 @@ function finishOnboarding(step, placement){
 }
 function recommendCourse(goals){
   var focusMap={'Arithmetic':'numbers-101','Fractions':'fractions-decimals-percents','Algebra':'algebra-1-linear','Geometry':'geometry-essentials','Calculus':'what-calculus-is','Mental math':'mental-math-toolkit','Test prep':'problem-solving-polya'};
-  if(goals.level==='Beginner') return COURSES.filter(function(c){return c.id==='numbers-101';})[0]||COURSES[0];
   if(goals.focus&&goals.focus.length){ var id=focusMap[goals.focus[0]]; var c=COURSES.filter(function(x){return x.id===id;})[0]; if(c) return c; }
-  return COURSES[0];
+  var byLevel={ Beginner:'numbers-101', Intermediate:'algebra-1-linear', Advanced:'what-calculus-is' };   // the placement/onboarding level now actually steers the recommendation
+  var lc=COURSES.filter(function(x){return x.id===(byLevel[goals.level]||'numbers-101');})[0];
+  return lc || COURSES[0];
 }
 
 // ================================================================
@@ -6963,7 +7172,7 @@ function handleAct(act, arg, target){
     case 'syncSignIn': syncSignIn(); break;
     case 'syncSignUp': syncSignUp(); break;
     case 'syncNow': SYNC.pullNow(); break;
-    case 'syncSignOut': SYNC.signOut(); break;
+    case 'syncSignOut': syncSignOut(); break;
     case 'emailAlex': window.location.href='mailto:alexshen1227@gmail.com?subject=Axiom%20feedback'; break;
     case 'openOnboarding': openOnboarding(); break;
     case 'applyUpdate': applyUpdate(); break;
@@ -7165,6 +7374,7 @@ function init(){
   applyMotion();
   buildGlossIndex();
   refreshStreakUI();
+  stampLegacyProgress();   // stamp pre-sync progress BEFORE checkStreakBroken — a freeze-spend would otherwise saveState() and re-stamp updatedAt=now()
   checkStreakBroken();
   updateHeaderProgress();
   // splash only in standalone
@@ -7177,7 +7387,6 @@ function init(){
   if(params.review){ setTimeout(startReview, 300); }
   // retro-unlock any achievements already earned by existing progress (silent for fresh users)
   checkAchievements();
-  stampLegacyProgress();   // give pre-sync progress a real timestamp before the first pull
   SYNC.init();   // restore any cloud session + pull (no-op unless configured & signed in)
   if(!state.hasOnboarded && state.solvedTotal===0){ setTimeout(openOnboarding, standalone?2200:400); }
 }
@@ -7189,7 +7398,7 @@ if(document.readyState==='loading') document.addEventListener('DOMContentLoaded'
 whenKatex(function(){ try{ RENDERERS[state.tab] && RENDERERS[state.tab](); }catch(e){} });
 
 // expose a tiny hook for debugging/self-test
-window.__AXIOM = { state:function(){return state;}, SKILLS:SKILLS, evalExpr:evalExpr, GEN:GEN, levelInfo:function(){return levelInfo();}, awardXp:awardXp, checkAchievements:checkAchievements, ACHIEVEMENTS:ACHIEVEMENTS };
+window.__AXIOM = { state:function(){return state;}, SKILLS:SKILLS, evalExpr:evalExpr, GEN:GEN, levelInfo:function(){return levelInfo();}, awardXp:awardXp, checkAchievements:checkAchievements, ACHIEVEMENTS:ACHIEVEMENTS, mergeStates:mergeStates, trackSkillIds:trackSkillIds, buildItemFromSkill:buildItemFromSkill, SKILL_BY_ID:SKILL_BY_ID };
 
 // ================================================================
 // SERVICE WORKER + UPDATE FLOW

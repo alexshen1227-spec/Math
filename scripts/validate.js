@@ -169,7 +169,7 @@ if (AX) {
   const rng = () => { seed = (seed * 1103515245 + 12345) & 0x7fffffff; return seed / 0x7fffffff; };
   genSkills.forEach((s) => {
     let firstBad = null;
-    for (let diff = 0; diff <= 3; diff++) {
+    for (let diff = 0; diff <= 4; diff++) {
       for (let i = 0; i < 60; i++) {
         totalRuns++;
         let p;

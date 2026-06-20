@@ -844,7 +844,7 @@ window.AXIOM_BANKS = [
   {
     id: 'fraction-concept-bank',
     name: 'Fraction concepts',
-    topic: 'Fractions & Ratio',
+    topic: 'Fractions',
     level: 'Beginner',
     items: [
       {
